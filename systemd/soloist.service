@@ -1,0 +1,53 @@
+[Unit]
+Description=Spotify Soloist (Spotify Connect -> HDMI)
+Documentation=https://developer.spotify.com/documentation/soloist
+# PipeWire provides the HDMI sink; start after it is up.
+After=pipewire.service wireplumber.service pipewire-pulse.service
+Wants=pipewire.service wireplumber.service
+# Never give up: on boot the service may start before Wi-Fi has associated,
+# and Restart=always must not trip systemd's start-rate limiter.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# SOLOIST_API_KEY and SOLOIST_DEVICE_NAME live here, outside the repo, mode 0600.
+# Deliberately NOT ~/.config/soloist: systemd symlinks a user unit's
+# StateDirectory onto that path, which would drop the secret into the same
+# directory soloist writes its state and crash dumps into.
+EnvironmentFile=%h/.config/soloist-hdmi/env
+
+# soloist prefers $STATE_DIRECTORY / $CACHE_DIRECTORY when systemd sets them.
+# StateDirectory keeps the device identity + Connect session stable across restarts.
+StateDirectory=soloist
+CacheDirectory=soloist
+
+ExecStart=/usr/local/bin/soloist \
+    --device-name "${SOLOIST_DEVICE_NAME}" \
+    --api-key "${SOLOIST_API_KEY}" \
+    --pipewire-device "${SOLOIST_PIPEWIRE_NODE}" \
+    --initial-volume "${SOLOIST_INITIAL_VOLUME}" \
+    --cache-size "${SOLOIST_CACHE_SIZE_MB}" \
+    --ws 127.0.0.1:3678
+
+Restart=always
+RestartSec=5
+
+# Builds expire 90 days after their build date and exit with code 10.
+# Restarting an expired binary is pointless - stop and let the updater fix it.
+RestartPreventExitStatus=10
+
+# Modest hardening. soloist needs the network, the PipeWire socket in
+# XDG_RUNTIME_DIR, and its own state/cache dirs - nothing else.
+# (No ProtectHome= : for a user unit StateDirectory lands under ~/.local/state.)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=default.target

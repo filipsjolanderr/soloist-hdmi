@@ -1,0 +1,9 @@
+# The API key lives in ~/.config/soloist/env, never in the repo.
+# This is belt-and-braces in case a copy is ever made here.
+soloist.env
+*.env
+!*.env.example
+
+# Downloaded binaries / archives - do not redistribute Soloist builds.
+soloist
+*.tar.gz

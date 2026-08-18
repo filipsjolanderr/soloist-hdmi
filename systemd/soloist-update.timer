@@ -1,0 +1,12 @@
+[Unit]
+Description=Weekly Spotify Soloist build refresh (builds expire after 90 days)
+
+[Timer]
+OnCalendar=weekly
+# The Pi may be powered off when the timer is due; catch up on next boot.
+Persistent=true
+# Don't have every install hit the CDN at the same instant.
+RandomizedDelaySec=2h
+
+[Install]
+WantedBy=timers.target
