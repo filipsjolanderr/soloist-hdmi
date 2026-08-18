@@ -47,7 +47,7 @@ ROLE_WEIGHTS = {
 }
 
 ART_FRAC = 0.64        # album art edge length as a fraction of screen height
-ART_RADIUS = 0.05      # art corner radius as a fraction of its edge
+ART_RADIUS = 0.025     # art corner radius as a fraction of its edge
 LEADING = 0.42         # gap under a line, as a fraction of its size
 
 # OLED pixel shift. Every static edge on screen - the artwork's border above
