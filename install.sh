@@ -10,7 +10,8 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 echo "==> Installing packages"
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
     pipewire pipewire-pulse pipewire-audio wireplumber pipewire-alsa \
-    python3-pil python3-numpy python3-websockets fonts-dejavu-core
+    python3-pil python3-numpy python3-websockets \
+    fonts-montserrat fonts-dejavu-core
 
 echo "==> Installing PipeWire config"
 mkdir -p "$HOME/.config/pipewire/pipewire.conf.d"

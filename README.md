@@ -136,9 +136,8 @@ Force an update by hand with:
 
 ### The TV screen
 
-`display/soloist-display.py` paints album art, title, artist, album and a
-progress bar straight to the Linux framebuffer, driven by Soloist's WebSocket
-API.
+`display/soloist-display.py` paints the album art, title, artist and album
+straight to the Linux framebuffer, driven by Soloist's WebSocket API.
 
 No X11, no Wayland, no browser. A Chromium kiosk is the usual way to do this
 and it will not fit here — the board has ~400 MB of RAM and one small core.
@@ -150,16 +149,49 @@ Details that matter:
   reads the real geometry and pixel format via `FBIOGET_VSCREENINFO` and
   refuses to run against anything else rather than painting garbage.
 - **Colour is dithered** with a 4x4 Bayer matrix before packing to RGB565.
-  Truncating 8-bit colour posterises the blurred backdrop into visible rings
-  on a large TV.
-- **The progress bar repaints only its own rows** each second, seeking into
-  the framebuffer rather than pushing all 1.8 MB. The cached base frame is
-  kept free of the bar, so the strip is composited from a clean crop — drawing
-  onto an already-painted base leaves stale text ghosting underneath.
-- **Position is extrapolated locally** from `position_ms`, `timestamp_ms` and
-  `speed`, so the bar moves smoothly between WebSocket events.
-- **The accent colour** (artist line, progress fill) is sampled from the
-  artwork, preferring saturated mid-bright pixels.
+  Truncating 8-bit colour posterises smooth tone into visible rings on a large
+  TV. Pure black is unaffected, so the background stays at 0,0,0.
+- **There is no progress bar and no clock.** Both were a second's worth of
+  moving pixels in a fixed place, which is the shape of burn-in, and neither
+  told you anything the music does not. Dropping them also took out the
+  per-second partial framebuffer write and the local position extrapolation
+  that fed it — the screen now only repaints when the track changes.
+- **The whole frame walks a circle** of radius 8 px, one of 16 steps every 45
+  seconds, so a full cycle takes 12 minutes. Nothing static — the artwork's
+  edge above all — sits on the same subpixels for long. The excursion is 16 px
+  end to end: invisible from the sofa, and well past a pixel.
+- **Text is bottom-aligned to the artwork.** The title/artist/album stack sits
+  on the cover's bottom edge, aligned on the last line's *baseline* rather
+  than its ink, so the block does not jump when a title happens to have no
+  descender.
+- **Nothing is tinted from the artwork.** The cover is the only saturated
+  thing in the frame; a second colour sampled out of it only ever competed
+  with it. One neutral grey ramp on black instead.
+
+#### The font is a stand-in
+
+Spotify sets its interface in **Circular** (Lineto), latterly in **Spotify
+Mix**. Both are licensed, neither is redistributable, so this repo does not
+ship either one and cannot fetch them for you.
+
+It will use them if you have them. The script picks the first family it finds
+on the font path, preferring, in order: Spotify Mix, Circular Sp, Circular
+Std, then **Montserrat** as the stand-in — the closest free geometric sans,
+with circular bowls, a double-storey `a` and a single-storey `g`. If you own a
+licence, drop the files anywhere under `~/.local/share/fonts` and restart the
+display service:
+
+```bash
+systemctl --user restart soloist-display.service
+```
+
+Matching is on squashed filenames, so `CircularStd-Book.otf` and `Circular Std
+Book.ttf` both work. The journal logs which family won at startup. The screen
+commits to **one** family for all three lines: a family that is present but
+missing a weight repeats its own faces rather than borrowing the next
+family's, because two designs on one screen reads as a bug, not a fallback.
+DejaVu is the last resort — `install.sh` guarantees it, and a plain screen
+beats no screen.
 
 The framebuffer console must be unbound first or it repaints the login console
 over the display; `scripts/fbcon.sh release` does this and the service calls it

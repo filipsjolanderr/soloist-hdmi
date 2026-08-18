@@ -7,3 +7,6 @@ soloist.env
 # Downloaded binaries / archives - do not redistribute Soloist builds.
 soloist
 *.tar.gz
+
+# Byte-compiled Python, left behind whenever the display script is imported.
+__pycache__/

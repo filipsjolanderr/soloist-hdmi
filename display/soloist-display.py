@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """Now-playing screen for the HDMI output.
 
-Listens to the Soloist WebSocket API and paints album art, title and artist
-straight to the Linux framebuffer. No X11, no Wayland, no browser - a Pi Zero
-2 W has ~400 MB of RAM and one small core, so a kiosk browser is not an option.
+Listens to the Soloist WebSocket API and paints album art, title, artist and
+album straight to the Linux framebuffer. No X11, no Wayland, no browser - a Pi
+Zero 2 W has ~400 MB of RAM and one small core, so a kiosk browser is not an
+option.
 
 The framebuffer console (fbcon) must be unbound first or it will draw the text
 console over us; see scripts/fbcon.sh.
 """
-import asyncio, fcntl, hashlib, io, json, logging, os, struct, sys, time
+import asyncio, fcntl, hashlib, io, json, logging, math, os, struct, sys
 import urllib.request
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 import websockets
 
@@ -22,18 +23,101 @@ STATE_DIR = Path(os.environ.get("STATE_DIRECTORY",
                  Path.home() / ".local/state/soloist"))
 CACHE_DIR = Path(os.environ.get("CACHE_DIRECTORY",
                  Path.home() / ".cache/soloist-display"))
-FONT_DIR = Path("/usr/share/fonts/truetype/dejavu")
 
-BG_DIM = 0.34          # how far the blurred backdrop is darkened
-ART_FRAC = 0.63        # album art edge length as a fraction of screen height
-TICK_SECONDS = 1.0     # progress bar refresh
+# Spotify sets its interface in Circular (Lineto), latterly in Spotify Mix.
+# Both are licensed and neither is redistributable, so this repo cannot ship
+# them - but it will use them: drop a licensed copy anywhere under
+# ~/.local/share/fonts and it is picked up on the next restart. Failing that
+# Montserrat stands in, the closest free geometric sans - circular bowls, a
+# double-storey 'a', a single-storey 'g' - and DejaVu is the last resort,
+# because install.sh guarantees it and a plain screen beats no screen.
+FONT_DIRS = (Path.home() / ".local/share/fonts",
+             Path("/usr/local/share/fonts"),
+             Path("/usr/share/fonts"))
+FONT_FAMILIES = ("spotifymixui", "spotifymix", "circularspui", "circularsp",
+                 "circularstd", "circular", "montserrat", "inter", "dejavusans")
+# Weight per role, best first. Circular calls its regular weight Book, and
+# DejaVu gives that weight no name at all, hence the empty string.
+ROLE_WEIGHTS = {
+    "title": ("medium", "book", "regular", ""),
+    "body": ("regular", "book", "light", ""),
+    "label": ("semibold", "demibold", "bold", "medium"),
+}
 
+ART_FRAC = 0.64        # album art edge length as a fraction of screen height
+ART_RADIUS = 0.05      # art corner radius as a fraction of its edge
+LEADING = 0.42         # gap under a line, as a fraction of its size
+
+# OLED pixel shift. Every static edge on screen - the artwork's border above
+# all - is walked slowly around a small circle so it never sits on the same
+# subpixels for long. The excursion is 2*SHIFT_RADIUS px over a full cycle,
+# below the threshold of notice at 2 m but well past a pixel.
+SHIFT_RADIUS = 8
+SHIFT_STEPS = 16
+SHIFT_SECONDS = 45     # a full cycle therefore takes 12 minutes
+
+# One neutral ramp on pure black. Nothing on screen is tinted from the
+# artwork: the cover is the only saturated thing in the frame, and a second
+# colour pulled out of it only ever competes with it.
+BLACK = (0, 0, 0)
+TEXT = (244, 244, 244)         # title
+TEXT_MUTED = (150, 150, 150)   # artist
+TEXT_FAINT = (100, 100, 100)   # album, status
+PLACEHOLDER = (20, 20, 20)     # stands in for missing artwork
+
+
+# --------------------------------------------------------------------------
+# Fonts
+# --------------------------------------------------------------------------
+def _font_index():
+    """Every font file on the search path, keyed by its squashed stem.
+
+    Squashing case and punctuation is what lets one table match both
+    "CircularStd-Book.otf" and "Circular Std Book.ttf". Earlier directories
+    win, so a font dropped in $HOME overrides the packaged one.
+    """
+    idx = {}
+    for d in FONT_DIRS:
+        if not d.is_dir():
+            continue
+        for f in sorted(d.rglob("*")):
+            if f.suffix.lower() in (".otf", ".ttf"):
+                idx.setdefault("".join(c for c in f.stem.lower() if c.isalnum()), f)
+    return idx
+
+
+def resolve_fonts():
+    """Pick one family for the whole screen, and a file for each role.
+
+    The first family with any face at all wins outright. Filling a missing
+    weight from the next family down would put two designs on one screen,
+    which reads as a bug rather than as a fallback - so a family that is
+    present but partial repeats its own faces instead.
+    """
+    idx = _font_index()
+    for family in FONT_FAMILIES:
+        faces = {}
+        for role, weights in ROLE_WEIGHTS.items():
+            for w in weights:
+                if family + w in idx:
+                    faces[role] = idx[family + w]
+                    break
+        if not faces:
+            continue
+        spare = faces.get("body") or next(iter(faces.values()))
+        return family, {r: faces.get(r, spare) for r in ROLE_WEIGHTS}
+    raise RuntimeError(f"no usable font found under {', '.join(map(str, FONT_DIRS))}"
+                       " - install fonts-montserrat")
+
+
+FONT_FAMILY, _FACES = resolve_fonts()
+F_TITLE, F_BODY, F_LABEL = _FACES["title"], _FACES["body"], _FACES["label"]
 
 # --------------------------------------------------------------------------
 # Framebuffer
 # --------------------------------------------------------------------------
 class Framebuffer:
-    """RGB565 framebuffer. Supports writing a full frame or a strip of rows."""
+    """RGB565 framebuffer."""
 
     def __init__(self, path="/dev/fb0"):
         self.path = path
@@ -56,7 +140,8 @@ class Framebuffer:
 
     # 4x4 Bayer matrix. Truncating 8-bit colour to RGB565 posterises smooth
     # gradients into visible rings on a large TV; dithering the low bits first
-    # trades that for imperceptible noise.
+    # trades that for imperceptible noise. Black is unaffected - the offset
+    # cannot lift 0 above the first quantisation step - so it stays at 0,0,0.
     _BAYER = (np.array([[0, 8, 2, 10], [12, 4, 14, 6],
                         [3, 11, 1, 9], [15, 7, 13, 5]], dtype=np.float32) + 0.5) / 16.0
 
@@ -77,12 +162,6 @@ class Framebuffer:
         with open(self.path, "wb") as f:
             f.write(self._to_565(img))
 
-    def blit_rows(self, img_strip: Image.Image, y: int):
-        """Write only rows [y, y+strip.height) - avoids repainting 1.8 MB/s."""
-        with open(self.path, "r+b") as f:
-            f.seek(y * self.line_length)
-            f.write(self._to_565(img_strip))
-
 
 # --------------------------------------------------------------------------
 # Track state
@@ -91,23 +170,13 @@ class Track:
     def __init__(self):
         self.title = self.artist = self.album = ""
         self.cover_url = None
-        self.duration_ms = 0
-        self.position_ms = 0
-        self.timestamp_ms = 0
-        self.speed = 1
         self.status = "stopped"
         self.device_name = ""
 
     @property
     def key(self):
-        """Identity for deciding whether a full repaint is needed."""
+        """Identity for deciding whether a repaint is needed."""
         return (self.title, self.artist, self.album, self.cover_url, self.status)
-
-    def elapsed_ms(self):
-        if self.status != "playing":
-            return self.position_ms
-        drift = (time.time() * 1000) - self.timestamp_ms
-        return min(self.position_ms + drift * self.speed, self.duration_ms or 1e12)
 
     def update(self, msg):
         if msg.get("type") == "auth_state":
@@ -134,13 +203,6 @@ class Track:
         self.cover_url = (by_size.get("large") or by_size.get("xlarge")
                           or by_size.get("default") or by_size.get("small"))
 
-        # NB: playback sits under decorations, not directly on item.
-        self.duration_ms = (dec.get("playback") or {}).get("duration_ms", 0) or 0
-        pos = msg.get("position") or {}
-        self.position_ms = pos.get("position_ms", 0) or 0
-        self.timestamp_ms = pos.get("timestamp_ms", time.time() * 1000)
-        self.speed = pos.get("speed", 1) or 1
-
 
 # --------------------------------------------------------------------------
 # Rendering
@@ -162,29 +224,52 @@ def fetch_cover(url: str) -> Image.Image | None:
         return None
 
 
-def accent_from(img: Image.Image):
-    """Pick a saturated, TV-legible accent colour from the artwork."""
-    small = img.resize((32, 32), Image.BILINEAR).convert("HSV")
-    a = np.asarray(small).reshape(-1, 3).astype(int)
-    # prefer saturated, mid-to-bright pixels; fall back to plain average
-    good = a[(a[:, 1] > 70) & (a[:, 2] > 70)]
-    if len(good) < 12:
-        good = a
-    h = int(np.median(good[:, 0]))
-    s = min(255, int(np.median(good[:, 1])) + 60)
-    v = max(170, int(np.median(good[:, 2])))
-    return Image.new("HSV", (1, 1), (h, s, v)).convert("RGB").getpixel((0, 0))
+def rounded_mask(size: int, radius: int, supersample: int = 4) -> Image.Image:
+    """Antialiased rounded-square alpha mask for the artwork.
+
+    PIL fills rounded rectangles with hard pixels, and stepped corners are
+    obvious on a TV. Drawing 4x oversized and shrinking with LANCZOS smooths
+    them; the mask only depends on the art size, so it is built once.
+    """
+    s = size * supersample
+    mask = Image.new("L", (s, s), 0)
+    ImageDraw.Draw(mask).rounded_rectangle(
+        (0, 0, s - 1, s - 1), radius=radius * supersample, fill=255)
+    return mask.resize((size, size), Image.LANCZOS)
 
 
-def fit_font(draw, text, font_path, size, max_w, min_size=20):
+def text_width(d, text, font, tracking=0.0):
+    if not tracking:
+        return d.textlength(text, font=font)
+    return (sum(d.textlength(c, font=font) for c in text)
+            + tracking * max(0, len(text) - 1))
+
+
+def draw_text(d, xy, text, font, fill, tracking=0.0):
+    """Draw a line, letter by letter when tracked - PIL has no tracking."""
+    if not tracking:
+        d.text(xy, text, font=font, fill=fill)
+        return
+    x, y = xy
+    for ch in text:
+        d.text((x, y), ch, font=font, fill=fill)
+        x += d.textlength(ch, font=font) + tracking
+
+
+def fit_font(d, text, font_path, size, max_w, min_size, tracking=0.0):
     """Shrink until it fits, then hard-truncate with an ellipsis."""
     while size > min_size:
         f = ImageFont.truetype(str(font_path), size)
-        if draw.textlength(text, font=f) <= max_w:
+        if text_width(d, text, f, tracking) <= max_w:
             return f, text
         size -= 2
+    # The loop above never tests min_size itself, and the status label asks
+    # for a size that is already its own floor - without this it would come
+    # out as "PAUSED…", ellipsed with 500 px of room to spare.
     f = ImageFont.truetype(str(font_path), min_size)
-    while text and draw.textlength(text + "…", font=f) > max_w:
+    if text_width(d, text, f, tracking) <= max_w:
+        return f, text
+    while text and text_width(d, text + "…", f, tracking) > max_w:
         text = text[:-1]
     return f, (text + "…" if text else "")
 
@@ -192,113 +277,91 @@ def fit_font(draw, text, font_path, size, max_w, min_size=20):
 class Renderer:
     def __init__(self, w, h):
         self.w, self.h = w, h
-        self.bold = FONT_DIR / "DejaVuSans-Bold.ttf"
-        self.regular = FONT_DIR / "DejaVuSans.ttf"
         self.margin = int(h * 0.10)
         self.art = int(h * ART_FRAC)
-        self.bar_y = int(h * 0.855)
-        self.strip_y = self.bar_y - 12
-        self.strip_h = int(h * 0.10)
-        self.accent = (235, 235, 235)
+        self.art_x = self.margin
+        self.art_y = (h - self.art) // 2
+        self.art_bottom = self.art_y + self.art
+        self.text_x = self.art_x + self.art + int(w * 0.05)
+        self.text_w = w - self.text_x - self.margin
+        self.art_mask = rounded_mask(self.art, max(8, int(self.art * ART_RADIUS)))
+        self.set_cover(None)
 
-    # -- backdrop ---------------------------------------------------------
-    def _backdrop(self, cover):
-        if cover is None:
-            return Image.new("RGB", (self.w, self.h), (14, 14, 16))
-        # blur cheaply: shrink hard, blur, scale back up
-        small = cover.resize((48, 48), Image.BILINEAR).filter(ImageFilter.GaussianBlur(9))
-        bg = small.resize((self.w, self.h), Image.BICUBIC)
-        return Image.eval(bg, lambda p: int(p * BG_DIM))
+    # -- text -------------------------------------------------------------
+    def _layout(self, d, rows, max_w):
+        """Fit each line to max_w and stack it. Returns the laid-out lines,
+        their y offsets, and the ink bounds of the stack as a whole."""
+        laid, offsets, y = [], [], 0
+        for path, size, text, fill, tracking in rows:
+            font, text = fit_font(d, text, path, size, max_w,
+                                  max(15, int(size * 0.55)), tracking)
+            laid.append((font, text, fill, tracking))
+            offsets.append(y)
+            y += font.size + int(font.size * LEADING)
+
+        boxes = [d.textbbox((0, off), t, font=f)
+                 for (f, t, _, _), off in zip(laid, offsets) if t]
+        top = min(b[1] for b in boxes) if boxes else 0
+        bottom = max(b[3] for b in boxes) if boxes else 0
+        return laid, offsets, top, bottom
+
+    def _draw_lines(self, d, laid, offsets, x, y, centre_in=None):
+        for (font, text, fill, tracking), off in zip(laid, offsets):
+            tx = x
+            if centre_in is not None:
+                tx = x + (centre_in - text_width(d, text, font, tracking)) / 2
+            draw_text(d, (tx, y + off), text, font, fill, tracking)
 
     # -- full frame -------------------------------------------------------
-    def render(self, track: Track, cover: Image.Image | None) -> Image.Image:
-        img = self._backdrop(cover)
+    def render(self, track: Track) -> Image.Image:
+        img = Image.new("RGB", (self.w, self.h), BLACK)
         d = ImageDraw.Draw(img)
-        self.accent = accent_from(cover) if cover is not None else (235, 235, 235)
 
-        art_x, art_y = self.margin, (self.h - self.art) // 2 - int(self.h * 0.035)
-        if cover is not None:
-            art = cover.resize((self.art, self.art), Image.LANCZOS)
-            # soft drop shadow
-            shadow = Image.new("RGBA", (self.art + 48, self.art + 48), (0, 0, 0, 0))
-            ImageDraw.Draw(shadow).rectangle(
-                [24, 28, self.art + 24, self.art + 30], fill=(0, 0, 0, 150))
-            shadow = shadow.filter(ImageFilter.GaussianBlur(14))
-            img.paste(shadow, (art_x - 24, art_y - 24), shadow)
-            img.paste(art, (art_x, art_y))
-        else:
-            d.rectangle([art_x, art_y, art_x + self.art, art_y + self.art],
-                        fill=(34, 34, 38))
-
-        tx = art_x + self.art + int(self.w * 0.045)
-        tw = self.w - tx - self.margin
-        y = art_y + int(self.h * 0.03)
-
+        # Idle: nothing but a line of text on black. This screen is up for
+        # hours between listening sessions, and a static panel is the one
+        # thing not to leave sitting on an OLED.
         if not track.title:
-            f = ImageFont.truetype(str(self.bold), 46)
-            d.text((tx, y), "Ready", font=f, fill=(245, 245, 245))
-            f2 = ImageFont.truetype(str(self.regular), 30)
-            d.text((tx, y + 64),
-                   f"Select “{track.device_name or 'this device'}” in Spotify",
-                   font=f2, fill=(165, 165, 172))
+            rows = [(F_TITLE, 40, "Ready", TEXT, 0),
+                    (F_BODY, 22,
+                     f"Select “{track.device_name or 'this device'}” in Spotify",
+                     TEXT_FAINT, 0)]
+            laid, offsets, top, bottom = self._layout(d, rows, self.w - 2 * self.margin)
+            self._draw_lines(d, laid, offsets, self.margin,
+                             (self.h - (bottom - top)) // 2 - top,
+                             centre_in=self.w - 2 * self.margin)
             return img
 
-        f_title, title = fit_font(d, track.title, self.bold, 58, tw, 30)
-        d.text((tx, y), title, font=f_title, fill=(250, 250, 250))
-        y += f_title.size + int(self.h * 0.028)
+        img.paste(self.artwork, (self.art_x, self.art_y), self.art_mask)
 
-        f_art, artist = fit_font(d, track.artist, self.regular, 40, tw, 22)
-        d.text((tx, y), artist, font=f_art, fill=self.accent)
-        y += f_art.size + int(self.h * 0.022)
-
-        if track.album:
-            f_alb, album = fit_font(d, track.album, self.regular, 29, tw, 18)
-            d.text((tx, y), album, font=f_alb, fill=(158, 158, 166))
-
-        return img
-
-    # -- progress strip ---------------------------------------------------
-    def _draw_progress(self, img, track: Track, y_offset: int = 0):
-        d = ImageDraw.Draw(img)
-        x0, x1 = self.margin, self.w - self.margin
-        y = self.bar_y + y_offset
-        h = 7
-        d.rounded_rectangle([x0, y, x1, y + h], radius=h // 2, fill=(72, 72, 78))
-
-        if track.duration_ms > 0:
-            frac = max(0.0, min(1.0, track.elapsed_ms() / track.duration_ms))
-            if frac > 0:
-                d.rounded_rectangle([x0, y, x0 + int((x1 - x0) * frac), y + h],
-                                    radius=h // 2, fill=self.accent)
-        f = ImageFont.truetype(str(self.regular), 24)
-        d.text((x0, y + 20), fmt_ms(track.elapsed_ms()), font=f, fill=(170, 170, 178))
-        dur = fmt_ms(track.duration_ms)
-        d.text((x1 - d.textlength(dur, font=f), y + 20), dur,
-               font=f, fill=(170, 170, 178))
-
+        rows = []
         if track.status != "playing":
-            label = track.status.upper()
-            fs = ImageFont.truetype(str(self.bold), 22)
-            d.text(((self.w - d.textlength(label, font=fs)) / 2, y + 20),
-                   label, font=fs, fill=(200, 200, 60))
+            rows.append((F_LABEL, 15, track.status.upper(), TEXT_FAINT, 3.5))
+        rows.append((F_TITLE, 50, track.title, TEXT, 0))
+        rows.append((F_BODY, 30, track.artist, TEXT_MUTED, 0))
+        rows.append((F_BODY, 23, track.album, TEXT_FAINT, 0))
 
-    def compose(self, base: Image.Image, track: Track) -> Image.Image:
-        """Full frame: clean base plus the current progress bar."""
-        img = base.copy()
-        self._draw_progress(img, track)
+        laid, offsets, _, _ = self._layout(d, [r for r in rows if r[2]], self.text_w)
+        # Sit the block on the artwork's bottom edge, aligned on the last
+        # line's baseline rather than its ink: baselines do not move when a
+        # title happens to have no descender, so the block stays put as
+        # tracks change.
+        ascent = laid[-1][0].getmetrics()[0]
+        self._draw_lines(d, laid, offsets, self.text_x,
+                         self.art_bottom - offsets[-1] - ascent)
         return img
 
-    def progress_strip(self, base: Image.Image, track: Track) -> Image.Image:
-        """Just the progress rows, cropped from the clean base - cheap enough
-        to repaint every second without touching the rest of the screen."""
-        strip = base.crop((0, self.strip_y, self.w, self.strip_y + self.strip_h))
-        self._draw_progress(strip, track, y_offset=-self.strip_y)
-        return strip
+    def set_cover(self, cover: Image.Image | None):
+        self.artwork = (cover.resize((self.art, self.art), Image.LANCZOS)
+                        if cover is not None
+                        else Image.new("RGB", (self.art, self.art), PLACEHOLDER))
 
-
-def fmt_ms(ms):
-    s = int(max(0, ms) // 1000)
-    return f"{s // 60}:{s % 60:02d}"
+    def shifted(self, base: Image.Image, step: int) -> Image.Image:
+        """The frame, walked one step around the pixel-shift circle."""
+        a = 2 * math.pi * (step % SHIFT_STEPS) / SHIFT_STEPS
+        img = Image.new("RGB", (self.w, self.h), BLACK)
+        img.paste(base, (round(SHIFT_RADIUS * math.cos(a)),
+                         round(SHIFT_RADIUS * math.sin(a))))
+        return img
 
 
 # --------------------------------------------------------------------------
@@ -312,30 +375,36 @@ def ws_url():
 
 
 async def run():
+    LOG.info("fonts: %s", FONT_FAMILY)
     fb = Framebuffer()
     rend = Renderer(fb.width, fb.height)
     track = Track()
-    cover = None
     base = None
+    shift = 0
     last_key = None
+    loaded_url = None
+
+    def paint():
+        fb.blit(rend.shifted(base, shift))
 
     async def repaint_full():
         nonlocal base
-        base = rend.render(track, cover)
-        fb.blit(rend.compose(base, track))
+        base = rend.render(track)
+        paint()
 
     await repaint_full()
 
-    async def ticker():
+    async def pixel_shift():
+        nonlocal shift
         while True:
-            await asyncio.sleep(TICK_SECONDS)
-            if base is not None and track.title and track.duration_ms:
-                try:
-                    fb.blit_rows(rend.progress_strip(base, track), rend.strip_y)
-                except Exception as e:
-                    LOG.warning("progress update failed: %s", e)
+            await asyncio.sleep(SHIFT_SECONDS)
+            shift += 1
+            try:
+                paint()
+            except Exception as e:
+                LOG.warning("pixel shift failed: %s", e)
 
-    asyncio.create_task(ticker())
+    asyncio.create_task(pixel_shift())
 
     backoff = 1
     while True:
@@ -352,10 +421,14 @@ async def run():
                     track.update(msg)
                     if track.key != last_key:
                         last_key = track.key
-                        if track.cover_url:
+                        # keyed on what actually loaded, so a failed fetch is
+                        # retried and a track with no artwork falls back to the
+                        # placeholder instead of keeping the previous cover
+                        if track.cover_url != loaded_url:
                             new = await asyncio.to_thread(fetch_cover, track.cover_url)
-                            if new is not None:
-                                cover = new
+                            if new is not None or track.cover_url is None:
+                                rend.set_cover(new)
+                                loaded_url = track.cover_url
                         await repaint_full()
         except Exception as e:
             LOG.warning("websocket error: %s (retry in %ds)", e, backoff)
