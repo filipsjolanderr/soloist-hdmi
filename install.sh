@@ -11,7 +11,7 @@ echo "==> Installing packages"
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
     pipewire pipewire-pulse pipewire-audio wireplumber pipewire-alsa \
     python3-pil python3-numpy python3-websockets \
-    fonts-montserrat fonts-dejavu-core
+    fonts-nunito-sans fonts-montserrat fonts-dejavu-core
 
 echo "==> Installing PipeWire config"
 mkdir -p "$HOME/.config/pipewire/pipewire.conf.d"

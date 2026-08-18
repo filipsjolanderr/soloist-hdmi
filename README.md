@@ -168,30 +168,48 @@ Details that matter:
   thing in the frame; a second colour sampled out of it only ever competed
   with it. One neutral grey ramp on black instead.
 
-#### The font is a stand-in
+#### The font
 
-Spotify sets its interface in **Circular** (Lineto), latterly in **Spotify
+The screen is set in **Nunito Sans** — Medium for the title, Regular for
+artist and album, SemiBold for the status label. Raspberry Pi OS ships it and
+sets its own desktop in it, and `install.sh` pulls `fonts-nunito-sans` in
+regardless.
+
+Spotify sets *its* interface in **Circular** (Lineto), latterly in **Spotify
 Mix**. Both are licensed, neither is redistributable, so this repo does not
-ship either one and cannot fetch them for you.
-
-It will use them if you have them. The script picks the first family it finds
-on the font path, preferring, in order: Spotify Mix, Circular Sp, Circular
-Std, then **Montserrat** as the stand-in — the closest free geometric sans,
-with circular bowls, a double-storey `a` and a single-storey `g`. If you own a
-licence, drop the files anywhere under `~/.local/share/fonts` and restart the
-display service:
+ship either one and cannot fetch them for you — but it will use them if you
+have them. The script picks the first family it finds on the font path,
+preferring, in order: Spotify Mix, Circular Sp, Circular Std, **Nunito
+Sans**, Montserrat, Inter, DejaVu. If you own a licence, drop the files
+anywhere under `~/.local/share/fonts` and restart the display service:
 
 ```bash
 systemctl --user restart soloist-display.service
 ```
 
+To go back to the geometric look without a licence, delete Nunito Sans from
+the list in `display/soloist-display.py` and Montserrat picks it up — the
+closest free stand-in for Circular, with circular bowls, a double-storey `a`
+and a single-storey `g`.
+
 Matching is on squashed filenames, so `CircularStd-Book.otf` and `Circular Std
-Book.ttf` both work. The journal logs which family won at startup. The screen
-commits to **one** family for all three lines: a family that is present but
-missing a weight repeats its own faces rather than borrowing the next
-family's, because two designs on one screen reads as a bug, not a fallback.
-DejaVu is the last resort — `install.sh` guarantees it, and a plain screen
-beats no screen.
+Book.ttf` both work. A **variable** font names its weights inside the file
+rather than in the filename — Nunito Sans ships as one
+`NunitoSans-VariableFont_…ttf` holding everything from ExtraLight to Black —
+so those files are opened and their named instances matched instead. This is
+not optional politeness: a variable font opens at its *default* instance, and
+Nunito Sans defaults to ExtraLight, which at 2 m is barely there. The journal
+logs the family and the weight each role landed on at startup:
+
+```
+fonts: nunitosans (title Medium, body Regular, label SemiBold)
+```
+
+The screen commits to **one** family for all three lines: a family that is
+present but missing a weight repeats its own faces rather than borrowing the
+next family's, because two designs on one screen reads as a bug, not a
+fallback. DejaVu is the last resort — `install.sh` guarantees it, and a plain
+screen beats no screen.
 
 The framebuffer console must be unbound first or it repaints the login console
 over the display; `scripts/fbcon.sh release` does this and the service calls it

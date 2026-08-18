@@ -28,14 +28,16 @@ CACHE_DIR = Path(os.environ.get("CACHE_DIRECTORY",
 # Both are licensed and neither is redistributable, so this repo cannot ship
 # them - but it will use them: drop a licensed copy anywhere under
 # ~/.local/share/fonts and it is picked up on the next restart. Failing that
-# Montserrat stands in, the closest free geometric sans - circular bowls, a
-# double-storey 'a', a single-storey 'g' - and DejaVu is the last resort,
-# because install.sh guarantees it and a plain screen beats no screen.
+# the screen is set in Nunito Sans, which Raspberry Pi OS ships and sets its
+# own desktop in. Montserrat behind it is the closer stand-in for Circular if
+# you want the geometric look back, and DejaVu is the last resort, because
+# install.sh guarantees it and a plain screen beats no screen.
 FONT_DIRS = (Path.home() / ".local/share/fonts",
              Path("/usr/local/share/fonts"),
              Path("/usr/share/fonts"))
 FONT_FAMILIES = ("spotifymixui", "spotifymix", "circularspui", "circularsp",
-                 "circularstd", "circular", "montserrat", "inter", "dejavusans")
+                 "circularstd", "circular", "nunitosans", "montserrat",
+                 "inter", "dejavusans")
 # Weight per role, best first. Circular calls its regular weight Book, and
 # DejaVu gives that weight no name at all, hence the empty string.
 ROLE_WEIGHTS = {
@@ -69,12 +71,17 @@ PLACEHOLDER = (20, 20, 20)     # stands in for missing artwork
 # --------------------------------------------------------------------------
 # Fonts
 # --------------------------------------------------------------------------
+def _squash(s):
+    """Case and punctuation dropped. This is what lets one table match
+    "CircularStd-Book.otf", "Circular Std Book.ttf" and "SemiBold" alike."""
+    return "".join(c for c in s.lower() if c.isalnum())
+
+
 def _font_index():
     """Every font file on the search path, keyed by its squashed stem.
 
-    Squashing case and punctuation is what lets one table match both
-    "CircularStd-Book.otf" and "Circular Std Book.ttf". Earlier directories
-    win, so a font dropped in $HOME overrides the packaged one.
+    Earlier directories win, so a font dropped in $HOME overrides the
+    packaged one.
     """
     idx = {}
     for d in FONT_DIRS:
@@ -82,12 +89,46 @@ def _font_index():
             continue
         for f in sorted(d.rglob("*")):
             if f.suffix.lower() in (".otf", ".ttf"):
-                idx.setdefault("".join(c for c in f.stem.lower() if c.isalnum()), f)
+                idx.setdefault(_squash(f.stem), f)
     return idx
 
 
+def _instances(path):
+    """The named instances of a variable font, keyed by squashed name.
+
+    A static family spells each weight in a filename. A variable one keeps
+    them all in one file - "NunitoSans-VariableFont_YTLC,opsz,wdth,wght.ttf" -
+    and names them inside, so opening it is the only way to see what it
+    holds. A static file raises here and simply has none. Italics call
+    themselves "Medium Italic" and so on, which is why they never answer to a
+    weight and the roman file always wins.
+    """
+    try:
+        names = ImageFont.truetype(str(path), 10).get_variation_names()
+    except (OSError, AttributeError):
+        return {}
+    return {_squash(n): n for n in (b.decode("utf-8", "replace") for b in names)}
+
+
+def _family_faces(family, idx):
+    """Every weight one family offers, as (file, instance) pairs.
+
+    Only files whose own name starts with the family are opened, so the
+    variable-font probe costs a load or two rather than a sweep of the entire
+    font path - 1.5 s of it, on this board.
+    """
+    faces = {}
+    for key, path in idx.items():
+        if not key.startswith(family):
+            continue
+        faces.setdefault(key[len(family):], (path, None))
+        for weight, instance in _instances(path).items():
+            faces.setdefault(weight, (path, instance))
+    return faces
+
+
 def resolve_fonts():
-    """Pick one family for the whole screen, and a file for each role.
+    """Pick one family for the whole screen, and a face for each role.
 
     The first family with any face at all wins outright. Filling a missing
     weight from the next family down would put two designs on one screen,
@@ -96,18 +137,29 @@ def resolve_fonts():
     """
     idx = _font_index()
     for family in FONT_FAMILIES:
+        available = _family_faces(family, idx)
         faces = {}
         for role, weights in ROLE_WEIGHTS.items():
             for w in weights:
-                if family + w in idx:
-                    faces[role] = idx[family + w]
+                if w in available:
+                    faces[role] = available[w]
                     break
         if not faces:
             continue
         spare = faces.get("body") or next(iter(faces.values()))
         return family, {r: faces.get(r, spare) for r in ROLE_WEIGHTS}
     raise RuntimeError(f"no usable font found under {', '.join(map(str, FONT_DIRS))}"
-                       " - install fonts-montserrat")
+                       " - install fonts-nunito-sans")
+
+
+def load_face(face, size):
+    """One face at one size. A variable font opens at its default instance -
+    ExtraLight, in Nunito Sans - so the weight has to be named to take."""
+    path, instance = face
+    f = ImageFont.truetype(str(path), size)
+    if instance:
+        f.set_variation_by_name(instance)
+    return f
 
 
 FONT_FAMILY, _FACES = resolve_fonts()
@@ -256,17 +308,17 @@ def draw_text(d, xy, text, font, fill, tracking=0.0):
         x += d.textlength(ch, font=font) + tracking
 
 
-def fit_font(d, text, font_path, size, max_w, min_size, tracking=0.0):
+def fit_font(d, text, face, size, max_w, min_size, tracking=0.0):
     """Shrink until it fits, then hard-truncate with an ellipsis."""
     while size > min_size:
-        f = ImageFont.truetype(str(font_path), size)
+        f = load_face(face, size)
         if text_width(d, text, f, tracking) <= max_w:
             return f, text
         size -= 2
     # The loop above never tests min_size itself, and the status label asks
     # for a size that is already its own floor - without this it would come
     # out as "PAUSED…", ellipsed with 500 px of room to spare.
-    f = ImageFont.truetype(str(font_path), min_size)
+    f = load_face(face, min_size)
     if text_width(d, text, f, tracking) <= max_w:
         return f, text
     while text and text_width(d, text + "…", f, tracking) > max_w:
@@ -292,8 +344,8 @@ class Renderer:
         """Fit each line to max_w and stack it. Returns the laid-out lines,
         their y offsets, and the ink bounds of the stack as a whole."""
         laid, offsets, y = [], [], 0
-        for path, size, text, fill, tracking in rows:
-            font, text = fit_font(d, text, path, size, max_w,
+        for face, size, text, fill, tracking in rows:
+            font, text = fit_font(d, text, face, size, max_w,
                                   max(15, int(size * 0.55)), tracking)
             laid.append((font, text, fill, tracking))
             offsets.append(y)
@@ -375,7 +427,8 @@ def ws_url():
 
 
 async def run():
-    LOG.info("fonts: %s", FONT_FAMILY)
+    LOG.info("fonts: %s (%s)", FONT_FAMILY,
+             ", ".join(f"{r} {i or p.stem}" for r, (p, i) in _FACES.items()))
     fb = Framebuffer()
     rend = Renderer(fb.width, fb.height)
     track = Track()
