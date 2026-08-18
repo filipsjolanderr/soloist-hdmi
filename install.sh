@@ -7,6 +7,11 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$HOME/.config/soloist-hdmi/env"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 
+echo "==> Installing packages"
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+    pipewire pipewire-pulse pipewire-audio wireplumber pipewire-alsa \
+    python3-pil python3-numpy python3-websockets fonts-dejavu-core
+
 echo "==> Installing PipeWire config"
 mkdir -p "$HOME/.config/pipewire/pipewire.conf.d"
 cp "$REPO/pipewire/10-hifi-hdmi.conf" "$HOME/.config/pipewire/pipewire.conf.d/"
@@ -16,6 +21,7 @@ mkdir -p "$HOME/.config/systemd/user"
 cp "$REPO/systemd/soloist.service" \
    "$REPO/systemd/soloist-update.service" \
    "$REPO/systemd/soloist-update.timer" \
+   "$REPO/systemd/soloist-display.service" \
    "$HOME/.config/systemd/user/"
 
 if [[ ! -f "$ENV_FILE" ]]; then
@@ -41,6 +47,13 @@ sleep 2
 echo "==> Enabling services"
 systemctl --user enable --now soloist-update.timer
 systemctl --user enable soloist.service
+systemctl --user enable soloist-display.service
+
+# /dev/fb0 access comes from the video group.
+if ! id -nG "$(id -un)" | tr " " "\n" | grep -qx video; then
+    echo "==> Adding $(id -un) to the video group (log out and back in to apply)"
+    sudo usermod -aG video "$(id -un)"
+fi
 
 if grep -q 'paste-your-key-here' "$ENV_FILE"; then
     echo
@@ -50,5 +63,6 @@ if grep -q 'paste-your-key-here' "$ENV_FILE"; then
 fi
 
 systemctl --user restart soloist.service
+systemctl --user restart soloist-display.service
 sleep 3
-systemctl --user --no-pager status soloist.service | head -20
+systemctl --user --no-pager status soloist.service | head -12

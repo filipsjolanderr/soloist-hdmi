@@ -13,6 +13,7 @@ over HDMI. Starts at boot, no login or display required.
 | Audio out | `vc4hdmi` → HDMI → Sony AV receiver |
 | PipeWire node | `alsa_output.platform-3f902000.hdmi.hdmi-stereo` |
 | Connect name | `Hi-Fi System` |
+| TV output | 1280x720 now-playing screen on `/dev/fb0` |
 
 This is the exact platform Spotify lists as the primary test target for the
 ARMv8/AArch64 build, so no compatibility workarounds are needed.
@@ -133,6 +134,42 @@ Force an update by hand with:
 ./scripts/update-soloist.sh
 ```
 
+### The TV screen
+
+`display/soloist-display.py` paints album art, title, artist, album and a
+progress bar straight to the Linux framebuffer, driven by Soloist's WebSocket
+API.
+
+No X11, no Wayland, no browser. A Chromium kiosk is the usual way to do this
+and it will not fit here — the board has ~400 MB of RAM and one small core.
+Rendering to `/dev/fb0` with PIL costs **3.3 % of one core and 12.6 MB RSS**.
+
+Details that matter:
+
+- **`/dev/fb0` is RGB565** (16 bpp, 1280x720, unpadded scanlines). The script
+  reads the real geometry and pixel format via `FBIOGET_VSCREENINFO` and
+  refuses to run against anything else rather than painting garbage.
+- **Colour is dithered** with a 4x4 Bayer matrix before packing to RGB565.
+  Truncating 8-bit colour posterises the blurred backdrop into visible rings
+  on a large TV.
+- **The progress bar repaints only its own rows** each second, seeking into
+  the framebuffer rather than pushing all 1.8 MB. The cached base frame is
+  kept free of the bar, so the strip is composited from a clean crop — drawing
+  onto an already-painted base leaves stale text ghosting underneath.
+- **Position is extrapolated locally** from `position_ms`, `timestamp_ms` and
+  `speed`, so the bar moves smoothly between WebSocket events.
+- **The accent colour** (artist line, progress fill) is sampled from the
+  artwork, preferring saturated mid-bright pixels.
+
+The framebuffer console must be unbound first or it repaints the login console
+over the display; `scripts/fbcon.sh release` does this and the service calls it
+via `ExecStartPre`, restoring it on stop. To get the console back on the TV by
+hand:
+
+```bash
+sudo ~/soloist-hdmi/scripts/fbcon.sh restore
+```
+
 ### Lingering
 
 `loginctl enable-linger` is required — without it these user services would
@@ -142,6 +179,7 @@ only run while a login session exists, which never happens on a headless box.
 
 ```bash
 systemctl --user status soloist.service      # is it up
+systemctl --user status soloist-display.service
 journalctl --user -u soloist.service -f      # follow logs
 systemctl --user restart soloist.service     # restart
 ./scripts/soloistctl status                  # playback control
@@ -176,6 +214,13 @@ wpctl status
 
 If the node name has changed, update `SOLOIST_PIPEWIRE_NODE` in
 `~/.config/soloist-hdmi/env`.
+
+**TV shows the terminal instead of the now-playing screen.** The display
+service is not running, or fbcon was rebound. Check
+`systemctl --user status soloist-display.service`.
+
+**TV screen is frozen on an old track.** The WebSocket connection dropped; the
+script reconnects with backoff, so check the journal for `websocket error`.
 
 **Nothing after a receiver power cycle.** Verify `video=HDMI-A-1:1280x720@60D`
 is still on the single line in `/boot/firmware/cmdline.txt`.
