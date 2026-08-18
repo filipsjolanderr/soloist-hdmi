@@ -12,7 +12,7 @@ over HDMI. Starts at boot, no login or display required.
 | OS | Debian 13 (trixie), aarch64, glibc 2.41 |
 | Audio out | `vc4hdmi` → HDMI → Sony AV receiver |
 | PipeWire node | `alsa_output.platform-3f902000.hdmi.hdmi-stereo` |
-| Connect name | `Receiver` |
+| Connect name | `Hi-Fi System` |
 
 This is the exact platform Spotify lists as the primary test target for the
 ARMv8/AArch64 build, so no compatibility workarounds are needed.
@@ -32,7 +32,7 @@ systemctl --user restart soloist.service
 ```
 
 Pair once by opening Spotify on any device on the same LAN and picking
-**Receiver** from the device picker. The session is stored in
+**Hi-Fi System** from the device picker. The session is stored in
 `~/.local/state/soloist`, so it survives restarts and reboots.
 
 ## Design notes
@@ -90,6 +90,33 @@ attenuation is applied and the receiver's own volume control does the work.
 Lower `SOLOIST_INITIAL_VOLUME` in the env file if you would rather have a
 quieter default, at the cost of some bit depth.
 
+### Volume normalization is not controllable here
+
+Soloist exposes **no** normalization setting. Verified three ways:
+
+- `soloist --help` has no normalization flag.
+- `soloist ctl` has no normalization command; the daemon's full WebSocket
+  command vocabulary is play / pause / next / prev / seek / volume / shuffle /
+  repeat / add_to_queue / activate / deactivate and nothing else.
+- `soloist ctl now --json` reports `options` as shuffle, repeat,
+  playback_speed and modes only, with no normalization field and no
+  normalization entry in `available_actions`.
+
+The engine does contain the machinery (`enable_normalization`,
+`NormalizerSetupImpl`, `normalize_level`, `PeakLimiter`) driven by the
+`audio.normalize_v2` preference, but that value arrives with the account's
+product state from Spotify and is not cached on disk here — nothing in this
+repo, and no local config file, can set it.
+
+So it is an **account-level setting**: change Audio Normalization in the
+Spotify app's playback settings. Anything applied by normalization happens
+inside Soloist before audio reaches PipeWire, so it cannot be undone
+downstream.
+
+Everything downstream of Soloist is already transparent: no resampling
+(negotiated `S32P / 44100 / 2ch`), sink volume at 1.00, no filters in the
+graph.
+
 ### Builds expire after 90 days
 
 Soloist binaries stop working 90 days after their build date and exit with
@@ -117,8 +144,15 @@ only run while a login session exists, which never happens on a headless box.
 systemctl --user status soloist.service      # is it up
 journalctl --user -u soloist.service -f      # follow logs
 systemctl --user restart soloist.service     # restart
-soloist ctl --help                           # local playback control
+./scripts/soloistctl status                  # playback control
+./scripts/soloistctl now                     # what's playing
 ```
+
+Use `scripts/soloistctl`, not bare `soloist ctl`. The daemon runs with
+systemd's `StateDirectory=`, so its pid and WebSocket files live in
+`~/.local/state/soloist`, while `soloist ctl` defaults to looking in
+`~/.local/share/soloist` — bare `ctl` reports `not running` even mid-playback.
+The wrapper just pins `-D` to the right directory.
 
 A WebSocket API is bound to `127.0.0.1:3678` (localhost only, deliberately) for
 scripted control. The resolved port is also written to

@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Wrapper for `soloist ctl`.
+#
+# The daemon runs under systemd with StateDirectory=soloist, so its runtime
+# files live in ~/.local/state/soloist. Bare `soloist ctl` instead looks in its
+# own default, ~/.local/share/soloist, finds no pid file, and reports
+# "not running" even while the daemon is happily playing. Pin the data dir.
+set -euo pipefail
+exec soloist ctl -D "${XDG_STATE_HOME:-$HOME/.local/state}/soloist" "$@"
