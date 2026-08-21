@@ -70,6 +70,151 @@ advertise 1080p as preferred, so do not "upgrade" this to 1920x1080.
 
 Original boot files are backed up as `/boot/firmware/*.bak-soloist`.
 
+### Forcing HDMI on breaks CEC, and CEC has to be re-armed
+
+Forcing the connector is not free. `video=…D` puts it in
+`DRM_FORCE_ON_DIGITAL`, and for a forced connector DRM skips the driver's
+`->detect()` callback entirely — which is exactly where `vc4_hdmi` hands the
+CEC adapter the physical address it reads out of the EDID.
+
+Nothing looks wrong when this happens. The EDID still arrives, because that is
+`->get_modes()`, which does still run: the modes are right, the ELD is right,
+audio plays. Only CEC is dead, and it is dead in a way that reads as a wiring
+fault rather than a software one — the adapter sits at physical address
+`f.f.f.f`, never claims a logical address, and is simply absent from the bus:
+
+```
+$ cec-ctl -d /dev/cec0
+	Physical Address           : f.f.f.f
+	Logical Address Mask       : 0x0000
+```
+
+The adapter cannot just be told its address. `vc4_hdmi` does not advertise
+`CEC_CAP_PHYS_ADDR`, so `cec-ctl --phys-addr` is refused outright:
+
+```
+The CEC adapter doesn't allow setting the physical address manually, ignore this option.
+```
+
+The address has to come from a real detect, so `scripts/cec-rearm.sh` borrows
+one: it drops the force, waits for the detect to land an address, and puts the
+force straight back. **The address survives the re-force** — that is the whole
+trick, and it is why this works without giving up the forced connector.
+
+`cec-rearm.service` runs it at boot, and `udev/99-cec-rearm.rules` runs it
+again on every HDMI hotplug, because a receiver power cycle can drop the
+address. The script is idempotent and takes a lock, so the change events its
+own writes generate settle out after one no-op run.
+
+Restoring the force is done through **debugfs**, not the sysfs `status` file.
+`status` only understands `on`, which is plain `DRM_FORCE_ON` — that loses the
+digital half of `DRM_FORCE_ON_DIGITAL` and takes the audio with it the next
+time the receiver is switched off. `debugfs/…/force` accepts `digital`. If
+debugfs is not mounted the script refuses to clear the force at all rather
+than leave the connector in a state it cannot restore.
+
+Check it with:
+
+```bash
+cec-ctl -d /dev/cec0 -S
+```
+
+which on this box should show the Pi at **2.3.0.0** as Playback Device 1,
+under the Sony at 2.0.0.0, under the TV at 0.0.0.0. That address is read from
+the receiver's EDID and encodes the physical wiring — the receiver is on the
+TV's HDMI 2, and the Pi is on the receiver's HDMI 3. Move either cable and the
+address changes on its own; nothing here hardcodes it.
+
+### A physical address is not enough, the adapter needs a logical one too
+
+Getting the physical address back is only half of being on the bus. The
+physical address says *where* we are wired; a **logical** address is what lets
+us transmit at all, and nothing gives us one by accident.
+
+`cec-ctl` only calls `CEC_ADAP_S_LOG_ADDRS` when it is given a device type —
+`--playback`, `--tv`, `--audio` and friends. Every invocation in this repo
+used to omit one, so the adapter settled into a state that looks entirely
+healthy at a glance:
+
+```
+	Physical Address           : 2.3.0.0     <- fine
+	Logical Address Mask       : 0x0000      <- not on the bus
+	Logical Addresses          : 0
+```
+
+The CEC core lets an unconfigured adapter transmit exactly one thing:
+`<Image View On>` from the Unregistered address to the TV. Everything else —
+every `--to 5` power query, every `<Standby>`, every `<Active Source>` — is
+refused with `ENONET`. And `cec-ctl` **exits 0 whether the message went out or
+never left**, so nothing in the exit status gives it away; the only honest
+signal is the `Tx, …` line it prints, which is why `soloist-cec.py` reads it
+rather than the return code.
+
+The visible symptom was not the receiver ignoring Soloist. It was the LG TV
+remote and the Shield remote both losing the ability to change the Sony's
+volume, while the amplifier itself was perfectly healthy — `System Audio Mode`
+on, unmuted, and obeying a `<User Control Pressed>` sent by hand. What the Pi
+was doing to the bus was sitting at 2.3.0.0 as a device that answers no polls,
+a ghost the other devices keep looking for. Giving it a logical address
+restored volume control immediately. Strictly, the causal chain from ghost to
+lost volume routing was never proven — but a device that holds a physical
+address and answers nothing is wrong regardless, and it is the only thing that
+changed.
+
+So `scripts/cec-rearm.sh` and `cec/soloist-cec.py` both ensure the adapter is
+configured before they rely on it:
+
+```bash
+cec-ctl -d /dev/cec0 --playback -o "Hi-Fi System"
+```
+
+`--playback` claims logical address **4**, falling back to 8 then 11. It will
+never take 5, so it cannot collide with the amplifier we are trying to talk
+to. The OSD name is capped at 14 characters by the spec.
+
+This is runtime kernel state and does **not** survive a reboot, which is why
+it is done in the boot path rather than once by hand. It does survive the
+physical address coming and going within a boot: `CEC_ADAP_S_LOG_ADDRS` stores
+the request, and the core re-claims automatically whenever a valid physical
+address turns up. `cec-rearm.sh` therefore configures before its early exits
+too, so the receiver-is-off path still leaves the claim armed for later.
+
+### What CEC is used for
+
+`cec/soloist-cec.py` watches the same WebSocket the screen does and does the
+two things you would otherwise pick up the remote for:
+
+- **Starting a Connect session switches the receiver over.** On the first
+  `playing` *or* `paused` state — picking "Hi-Fi System" in Spotify is itself
+  reason enough — it sends `<Image View On>` to the TV and broadcasts
+  `<Active Source>` with its own physical address. The receiver reads 2.3.0.0
+  as "behind my HDMI 3" and selects that input, so choosing the device in
+  Spotify is the only action needed to get sound.
+- **Half an hour of nothing sends the amplifier to standby.**
+  `SOLOIST_CEC_IDLE_MINUTES` in the env file, 0 to disable.
+
+Standby is addressed to logical address 5, the Audio System, and **not**
+broadcast. A broadcast `<Standby>` takes the TV down with the amplifier, and
+the TV is not ours to switch off — someone may be watching it with the music
+paused. For the same reason the idle timer checks first whether another device
+holds the active source, so leaving Spotify paused does not power off the
+amplifier out from under the SHIELD on the next input.
+
+That the round trip works at all is worth stating, because it is the thing
+that would quietly not: **the CEC address survives the amplifier going into
+standby.** The receiver drops the HDMI hotplug line when it powers down, which
+would normally take the EDID and the CEC address with it — and since a forced
+connector never runs another detect, the address would never come back and
+nothing could ever wake it again. It survives precisely *because* the
+connector is forced: with `->detect()` out of the picture, there is nothing
+left to invalidate it. Verified both directions on the hardware — amplifier to
+standby, address still `2.3.0.0`, wake on the next play.
+
+If the address has gone anyway, the daemon runs `cec-rearm.sh` itself before
+giving up, since the usual reason to have lost it is the very power cycle it
+is reacting to.
+
+
 ### 44.1 kHz, not 48 kHz
 
 `pipewire/10-hifi-hdmi.conf` sets the graph to 44.1 kHz with 48 kHz allowed.
@@ -260,6 +405,8 @@ only run while a login session exists, which never happens on a headless box.
 ```bash
 systemctl --user status soloist.service      # is it up
 systemctl --user status soloist-display.service
+systemctl --user status soloist-cec.service       # receiver control
+cec-ctl -d /dev/cec0 -S                      # what is on the CEC bus
 journalctl --user -u soloist.service -f      # follow logs
 systemctl --user restart soloist.service     # restart
 ./scripts/soloistctl status                  # playback control
@@ -304,3 +451,47 @@ script reconnects with backoff, so check the journal for `websocket error`.
 
 **Nothing after a receiver power cycle.** Verify `video=HDMI-A-1:1280x720@60D`
 is still on the single line in `/boot/firmware/cmdline.txt`.
+
+**CEC does nothing.** Check *both* addresses — they fail independently:
+
+```bash
+cec-ctl -d /dev/cec0 | grep -E "Physical Address|Logical Address"
+```
+
+`Physical Address: f.f.f.f` means the re-arm never landed. Re-arm it by hand
+with `sudo ./scripts/cec-rearm.sh`. Exit code 75 means the receiver was off or
+on another input, so there was no EDID to take an address from; switch it on
+and try again. `systemctl status cec-rearm.service` shows what happened at
+boot.
+
+`Logical Address Mask: 0x0000` with a valid physical address means the adapter
+is not on the bus and can transmit nothing but `<Image View On>`. That is the
+failure described above; `sudo ./scripts/cec-rearm.sh` fixes it too, or by
+hand with `cec-ctl -d /dev/cec0 --playback -o "Hi-Fi System"`. A healthy box
+shows mask `0x0010`, logical address 4.
+
+**Neither the TV remote nor the Shield remote can change the volume.** Prove
+where it breaks before touching anything, because the amplifier is usually
+innocent:
+
+```bash
+cec-ctl -d /dev/cec0 -s --to 5 --give-system-audio-mode-status
+cec-ctl -d /dev/cec0 -s --to 5 --give-audio-status
+```
+
+`sys-aud-status: on` and a volume that moves when you send
+`--to 5 --user-control-pressed ui-cmd=volume-up` means the receiver is fine
+and something upstream is not reaching it — check the Pi's logical address
+first.
+
+**The receiver does not switch input when playback starts.** Check
+`journalctl --user -u soloist-cec.service` for "claimed active source". Sony
+calls the setting that makes it obey **Control for HDMI**, and it has to be on
+at the receiver — CEC is advisory and a receiver with it switched off will
+take the message and ignore it. `SOLOIST_CEC_WAKE=0` turns the behaviour off
+at this end.
+
+**The receiver switches itself off while I am using it.** The idle timer only
+fires when nothing has played for `SOLOIST_CEC_IDLE_MINUTES` and no other
+device claims the active source; set `SOLOIST_CEC_STANDBY=0` to stop it
+entirely.

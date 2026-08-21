@@ -10,7 +10,7 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 echo "==> Installing packages"
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
     pipewire pipewire-pulse pipewire-audio wireplumber pipewire-alsa \
-    python3-pil python3-numpy python3-websockets \
+    python3-pil python3-numpy python3-websockets v4l-utils \
     fonts-nunito-sans fonts-montserrat fonts-dejavu-core
 
 echo "==> Installing PipeWire config"
@@ -23,7 +23,18 @@ cp "$REPO/systemd/soloist.service" \
    "$REPO/systemd/soloist-update.service" \
    "$REPO/systemd/soloist-update.timer" \
    "$REPO/systemd/soloist-display.service" \
+   "$REPO/systemd/soloist-cec.service" \
    "$HOME/.config/systemd/user/"
+
+echo "==> Installing the CEC re-arm service"
+# A system unit, not a user one: it writes sysfs/debugfs and is triggered by
+# udev. %h does not exist for system units, so bake the repo path in.
+sed "s|__REPO__|$REPO|g" "$REPO/systemd/cec-rearm.service" \
+    | sudo tee /etc/systemd/system/cec-rearm.service >/dev/null
+sudo cp "$REPO/udev/99-cec-rearm.rules" /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo systemctl daemon-reload
+sudo systemctl enable cec-rearm.service
 
 if [[ ! -f "$ENV_FILE" ]]; then
     echo "==> Creating $ENV_FILE from the example - EDIT IT AND ADD YOUR API KEY"
@@ -49,6 +60,7 @@ echo "==> Enabling services"
 systemctl --user enable --now soloist-update.timer
 systemctl --user enable soloist.service
 systemctl --user enable soloist-display.service
+systemctl --user enable soloist-cec.service
 
 # /dev/fb0 access comes from the video group.
 if ! id -nG "$(id -un)" | tr " " "\n" | grep -qx video; then
@@ -65,5 +77,6 @@ fi
 
 systemctl --user restart soloist.service
 systemctl --user restart soloist-display.service
+systemctl --user restart soloist-cec.service
 sleep 3
 systemctl --user --no-pager status soloist.service | head -12
