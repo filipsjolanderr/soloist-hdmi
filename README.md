@@ -139,9 +139,14 @@ Force an update by hand with:
 `display/soloist-display.py` paints the album art, title, artist and album
 straight to the Linux framebuffer, driven by Soloist's WebSocket API.
 
+The composition is a centred column — cover, title under it, then artist and
+album on their own lines, each a step smaller and a step greyer than the one
+above.
+
 No X11, no Wayland, no browser. A Chromium kiosk is the usual way to do this
 and it will not fit here — the board has ~400 MB of RAM and one small core.
-Rendering to `/dev/fb0` with PIL costs **3.3 % of one core and 12.6 MB RSS**.
+Rendering to `/dev/fb0` with PIL costs **3.3 % of one core and 8.9 MB RSS**,
+measured over 90 s of a paused track.
 
 Details that matter:
 
@@ -153,27 +158,52 @@ Details that matter:
   TV. Pure black is unaffected, so the background stays at 0,0,0.
 - **There is no progress bar and no clock.** Both were a second's worth of
   moving pixels in a fixed place, which is the shape of burn-in, and neither
-  told you anything the music does not. Dropping them also took out the
-  per-second partial framebuffer write and the local position extrapolation
-  that fed it — the screen now only repaints when the track changes.
+  told you anything the music does not. Dropping them also took out the local
+  position extrapolation that fed it — the screen repaints when the track
+  changes, and otherwise only for the pixel shift.
 - **The whole frame walks a circle** of radius 8 px, one of 16 steps every 45
   seconds, so a full cycle takes 12 minutes. Nothing static — the artwork's
   edge above all — sits on the same subpixels for long. The excursion is 16 px
   end to end: invisible from the sofa, and well past a pixel.
-- **Text is bottom-aligned to the artwork.** The title/artist/album stack sits
-  on the cover's bottom edge, aligned on the last line's *baseline* rather
-  than its ink, so the block does not jump when a title happens to have no
-  descender.
+- **The state is a glyph, not a word.** Paused dims the cover to 38 % and puts
+  a pause bar in the middle of it; buffering spins a tapered ring there. A
+  word set in caps is one more thing to read from the sofa, and a shape lands
+  before you focus on it. Nothing moves in the layout when the state changes,
+  because the glyph sits *on* the artwork rather than in the text.
+- **The spinner costs 60 rows, not a frame.** Scanlines are unpadded, so any
+  run of whole rows is one contiguous region of the device: the ring is
+  written on its own with a positioned `pwrite` at 23 ms a frame instead of
+  the 180 ms a full repaint takes. The Bayer matrix is phase-shifted to match
+  the band's first row, or the dither inside it would not line up with the
+  dither around it.
+- **Lines sit on their baselines, never on their ink.** Ink bounds move with
+  the string, so a title that happens to have no descender would otherwise
+  shove everything under it around. The title is the one line worth reading
+  from across the room: it gives up a tenth of its size at most before it
+  takes a *second* line instead, split as evenly as the words allow, and the
+  gap under it is measured from its last baseline either way.
+- **Every measure is a fraction of the screen height**, so 720p and 1080p get
+  the same composition rather than the same pixel sizes.
 - **Nothing is tinted from the artwork.** The cover is the only saturated
   thing in the frame; a second colour sampled out of it only ever competed
-  with it. One neutral grey ramp on black instead.
+  with it. One neutral grey ramp on black instead. A track with no cover at
+  all gets a note drawn on a near-black square, because a flat grey panel
+  reads as a failure and this reads as a decision.
+- **A daemon that goes away does not blank the screen.** A soloist restart is
+  a two-second blip, so the last frame is held for 20 seconds before the
+  screen admits it does not know what is playing and falls back to *Ready*.
+  Reconnection is attempted every 5 seconds and logged once per outage, not
+  once per attempt.
+- **The album art cache is capped** at the 300 most recently used covers
+  (`~/.cache/soloist-display`), touched on every hit. Downloads are decoded
+  before they are cached and renamed into place after, so a cut connection
+  cannot leave an entry that fails to open forever.
 
 #### The font
 
 The screen is set in **Nunito Sans** — Medium for the title, Regular for
-artist and album, SemiBold for the status label. Raspberry Pi OS ships it and
-sets its own desktop in it, and `install.sh` pulls `fonts-nunito-sans` in
-regardless.
+artist and album. Raspberry Pi OS ships it and sets its own desktop in it, and
+`install.sh` pulls `fonts-nunito-sans` in regardless.
 
 Spotify sets *its* interface in **Circular** (Lineto), latterly in **Spotify
 Mix**. Both are licensed, neither is redistributable, so this repo does not
@@ -202,10 +232,10 @@ Nunito Sans defaults to ExtraLight, which at 2 m is barely there. The journal
 logs the family and the weight each role landed on at startup:
 
 ```
-fonts: nunitosans (title Medium, body Regular, label SemiBold)
+fonts: nunitosans (title Medium, body Regular)
 ```
 
-The screen commits to **one** family for all three lines: a family that is
+The screen commits to **one** family for every line: a family that is
 present but missing a weight repeats its own faces rather than borrowing the
 next family's, because two designs on one screen reads as a bug, not a
 fallback. DejaVu is the last resort — `install.sh` guarantees it, and a plain
