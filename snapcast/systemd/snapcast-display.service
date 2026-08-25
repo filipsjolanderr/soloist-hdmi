@@ -13,7 +13,7 @@ Environment=PYTHONUNBUFFERED=1
 # Album art cache -> ~/.cache/soloist-display. No StateDirectory: there is no
 # local state any more, the now-playing state comes from snapserver over the
 # network.
-Environment=SNAPSERVER_HOST=192.168.0.134
+Environment=SNAPSERVER_HOST=__SERVER__
 Environment=SNAPCAST_STREAM=Spotify
 CacheDirectory=soloist-display
 

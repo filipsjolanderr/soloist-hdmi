@@ -9,7 +9,7 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 ExecStart=/usr/bin/snapclient \
-    --host 192.168.0.134 \
+    --host __SERVER__ \
     --player pulse \
     -s alsa_output.platform-3f902000.hdmi.hdmi-stereo \
     --hostID hifi-hdmi \

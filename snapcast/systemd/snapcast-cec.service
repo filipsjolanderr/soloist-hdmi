@@ -10,7 +10,7 @@ Type=simple
 # Without this python buffers stdout when it is not a tty and the journal
 # stays empty, which makes the service look silently broken.
 Environment=PYTHONUNBUFFERED=1
-Environment=SNAPSERVER_HOST=192.168.0.134
+Environment=SNAPSERVER_HOST=__SERVER__
 Environment=SNAPCAST_STREAM=Spotify
 # still carries the SOLOIST_CEC_* knobs; the API key is not needed here any more
 EnvironmentFile=%h/.config/soloist-hdmi/env

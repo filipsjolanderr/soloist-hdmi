@@ -1,292 +1,286 @@
 # soloist-hdmi — `aux` branch
 
-Headless [Spotify Soloist](https://developer.spotify.com/documentation/soloist)
-Spotify Connect endpoint on a Raspberry Pi 4, feeding a single speaker over the
-3.5mm analog jack. Starts at boot, no login or display required.
+A two-room Snapcast hi-fi built from two Raspberry Pis. Spotify Connect and
+Bluetooth in, two synchronised speakers out, no login or display required at
+either end.
 
-This is the `aux` branch. `main` is the Pi Zero 2 W box that feeds a Sony AV
-receiver over HDMI; the two share the daemon, the update timer and the control
-wrapper, and differ in everything to do with output.
+`main` is the original single box: one Pi Zero 2 W running Soloist straight into
+a Sony receiver over HDMI. This branch grew that into a server and two clients,
+and most of `main`'s hard-won HDMI notes no longer apply — see *What is gone*.
 
-## What this box is
+## The system
 
-| | |
-|---|---|
-| Host | `hifi2` — Raspberry Pi 4 Model B Rev 1.5 |
-| OS | Debian 13 (trixie), aarch64 |
-| Audio out | `bcm2835 Headphones` → 3.5mm jack → **right channel only** |
-| PipeWire node | `soloist_mono_right` (a mono sink in front of the hardware) |
-| Connect name | `Hi-Fi System` |
-| TV output | none |
+```
+  hifi2 — Pi 4 Model B, 192.168.0.134 — SERVER
+  ┌──────────────────────────────────────────────────────────┐
+  │  Soloist (Spotify Connect)                                │
+  │      └─► snapcast_spotify ──► /run/snapcast/spotify.fifo  │
+  │                                       │                   │
+  │                                  snapserver               │
+  │                          44100:16:2, FLAC, :1704          │
+  │                          control :1705, web :1780         │
+  └───────────┬──────────────────────────────┬────────────────┘
+              │                              │
+     snapclient (local)              snapclient over wifi
+     aux_mono_right → FR             hifi — Pi Zero 2 W, .162
+     3.5mm jack, one speaker         HDMI → Sony receiver
+                                     + now-playing screen on /dev/fb0
+                                     + receiver wake/standby over CEC
 
-## What is not here
+  Google Nest Hub ──Bluetooth A2DP──► aux_mono_right   (bypasses Snapcast)
+```
 
-Three things from `main` are gone, and none of them are coming back on analog:
+| | hifi2 | hifi |
+|---|---|---|
+| Board | Pi 4 Model B Rev 1.5 | Pi Zero 2 W Rev 1.0 |
+| Role | server + client | client |
+| Output | 3.5mm jack, mono → right | HDMI → Sony receiver |
+| Also runs | Soloist, Bluetooth sink | TV screen, CEC |
 
-- **`soloist-display`.** The now-playing screen paints to `/dev/fb0` over HDMI.
-  Nothing is plugged into HDMI here, and with no connector attached the vc4
-  driver publishes no framebuffer at all — there is no `/dev/fb0` to paint to.
-- **`soloist-cec` and `cec-rearm`.** CEC is a pair of wires in the HDMI
-  connector. With no HDMI link there is no bus, no receiver to wake, and no
-  input to switch. The udev rule and the `cec-rearm` system unit go with them.
-- **The forced connector.** `video=HDMI-A-1:1280x720@60D` in `cmdline.txt`
-  existed to stop the `vc4hdmi` ALSA card disappearing when the receiver powered
-  off, and forcing it is what broke CEC and required the whole re-arm dance in
-  the first place. The `bcm2835 Headphones` card is on the SoC and is always
-  present, so `cmdline.txt` is left completely untouched on this box.
+## What is gone
 
-The single most useful thing to understand about this branch is that the entire
-first half of `main`'s README describes a problem that analog output does not
-have.
+Three things from `main` that this branch does not have, and why:
+
+- **Soloist on the Zero.** hifi2 is the Connect endpoint now. Two boxes
+  advertising `Hi-Fi System` would appear twice in Spotify's picker and race for
+  the session — which is exactly what the logs showed while both were up.
+- **The Zero's local Soloist WebSocket.** The screen and the CEC daemon read it.
+  They now read snapserver's control API instead, which is a smaller change than
+  it sounds and a more correct source: they react to whatever the *system* is
+  playing rather than to one particular endpoint.
+- **The forced HDMI connector, on hifi2 only.** `video=HDMI-A-1:1280x720@60D`
+  existed to stop the `vc4hdmi` ALSA card vanishing when the receiver powered
+  off. hifi2 outputs analog and has nothing plugged into HDMI, so its
+  `cmdline.txt` is untouched. **The Zero still needs it**, and still needs the
+  whole CEC re-arm dance in `main`'s README that follows from it.
+
+## Design notes
+
+### Google Cast is not possible, and Bluetooth is the answer anyway
+
+The Hub cannot cast to this system. Google Cast authenticates the *receiver*
+with a Google-issued device certificate that senders validate, so it cannot be
+implemented outside certified hardware — every open-source Cast project
+(`pychromecast`, `catt`, `mkchromecast`, `node-castv2`) is a **sender**. No
+amount of work makes a Pi appear in the Google Home app as a cast target.
+
+What does work, and is what the Hub is actually for here: a Nest Hub will use a
+**paired Bluetooth speaker** as its audio output. hifi2 advertises itself as one
+— class `0x200414`, Audio/Video major, Loudspeaker minor, which is what makes
+the Hub offer to pair with it at all rather than seeing a generic computer.
+
+**Bluetooth deliberately bypasses Snapcast.** It could have been another
+snapserver source scoped to one group, and that would be tidier. Measured
+against the tone test, the Snapcast path adds ~1.0 s of buffering versus ~0.16 s
+routing straight to the sink. That is fine for music and wrong for a Hub that
+also speaks timers and answers questions. PipeWire mixes the two, so the Hub
+talks *over* whatever Snapcast is playing instead of fighting it for the output.
+
+`scripts/bt-audio-route.py` makes the connection, because PipeWire will not:
+sources are not linked to sinks automatically (PulseAudio's
+`module-bluetooth-policy` used to do this; WirePlumber ships no equivalent). It
+matches `bluez_input.*` specifically rather than "capture the default source",
+which would grab a future USB microphone and feed it to the speaker.
+
+Pairing is `NoInputNoOutput` — there is no keypad here to confirm a passkey on,
+which is how any standalone BT speaker behaves. It also means anything in range
+can pair while the adapter is discoverable. Once the Hub is paired:
+
+```bash
+bluetoothctl -- discoverable off
+```
+
+### 100 % volume is +4 dB on this card, not unity
+
+`main` runs the sink at 1.00 and `SOLOIST_INITIAL_VOLUME=100` so nothing
+attenuates digitally and the amplifier does the work. The reasoning holds; the
+hardware does not cooperate. The bcm2835 `PCM` control runs from **−102.39 dB to
++4.00 dB**, and WirePlumber maps sink volume 1.00 onto the top of it. Ported
+literally, "no attenuation" is +4 dB of digital *boost* into a PWM DAC, and
+full-scale material clips.
+
+`snapcast/server/50-aux-softmixer.conf` sets `api.alsa.soft-mixer`, so volume is
+applied in software — a no-op multiply at 1.00 — and the ALSA control is never
+written. `install.sh` pins it at `0dB` and runs `alsactl store`.
+
+**Both matches in that file are load-bearing and they are not redundant.**
+Volume reaches the card by two paths, the node's mixer and the device's route,
+and *the device route is the one that bites*: set the property on the node alone
+and it reads back as `True` while the control still snaps to +4 dB on every
+WirePlumber restart. The two objects also have to be matched on **different
+keys** — `alsa.card_name` is not yet populated on the device when device rules
+run, only `api.alsa.card.name` is. Matching the card by name rather than by node
+name is also what keeps that one file free of the SoC address.
+
+`device.restore-routes = false` looks like the fix and is not: with route
+restore off, WirePlumber applies `device.routes.default-sink-volume` instead,
+which defaults to exactly the 0.40 you were trying to escape.
+
+### The Zero had been playing 5.4 dB quiet all along
+
+Worth recording because nothing looked wrong. With both rooms up, the Zero's
+HDMI output measured 0.2414 peak against a 0.4500 source — ×0.5365 — while
+hifi2's aux measured exactly as predicted. Every obvious volume read unity: sink
+1.00, `channelVolumes [1.0, 1.0]`, device route [1.0, 1.0], ALSA `PCM` 255/255
+at 0.00 dB. Playing straight to the sink with Snapcast out of the picture gave
+the identical figure, so it was never Snapcast.
+
+It was WirePlumber's saved stream state:
+
+```
+Output/Audio:media.role:Music={"channelVolumes":[0.536371, 0.536371], ...}
+```
+
+Keyed on the **`Music` role**, not on an application — which is why `pw-play`
+and `snapclient`, two unrelated programs, were attenuated by precisely the same
+factor. It predates this branch entirely: `main`'s stated design is "sink at
+1.00, no digital attenuation, let the receiver do the work", and a stale
+per-role stream volume had been quietly defeating it. Reset to 1.0, the Zero
+now reproduces the source exactly.
+
+The lesson generalises: on this stack a volume you can see being 1.00 is not
+evidence that the signal is untouched. Measure the output.
+
+### Mono, on the right channel only
+
+hifi2 has one speaker, wired to the right side of the jack.
+`snapcast/server/20-mono-right.conf` publishes a sink with a single `MONO`
+channel and loops it into the hardware sink positioned at `FR`.
+
+- **Both source channels survive**, downmixed `0.5·FL + 0.5·FR`. Sending stereo
+  and simply not connecting the left plug would throw away everything panned
+  left. The coefficients sum to 1.0, so a centred mix cannot clip.
+- **`stream.dont-remix = true` is what makes it one channel.** Without it
+  PipeWire upmixes the single channel back to both `FL` and `FR`.
+- **Targeting by node name survives a default-sink change** — plug a monitor
+  into hifi2 and WirePlumber may move the default; playback does not care.
+
+### 44.1 kHz and FLAC, end to end
+
+Spotify streams at 44.1 kHz. PipeWire defaults to 48 kHz and snapserver defaults
+to 48000:16:2; both are pinned to 44100:16:2 so nothing resamples between
+Soloist and either speaker. The bcm2835 device takes 44.1 kHz directly
+(`hw_params` reports `rate: 44100`, no plug layer), and so does the vc4hdmi.
+
+Snapcast's transport codec is FLAC — lossless, and roughly half the wifi traffic
+of PCM's 1.4 Mbit/s per client, which matters for a Zero 2 W on wifi.
+
+Two honest limits on the word *lossless*: Spotify's own stream quality is an
+account setting, not something this repo controls; and hifi2's analog stage is a
+firmware-driven PWM DAC whose behaviour is neither visible nor controllable from
+Linux. What is guaranteed here is that nothing between Soloist and the DAC
+resamples or attenuates.
+
+### Soloist reaches snapserver through a pipe-tunnel sink
+
+The usual recipe for feeding snapserver from PipeWire is a null sink plus a
+`pw-record`/`parec` process capturing its monitor. `libpipewire-module-pipe-tunnel`
+does it as one object: a sink that writes raw PCM straight into the FIFO. No
+capture process to supervise, and no WAV header — which snapserver's pipe source
+would otherwise play as a click at the start of the stream.
+
+The FIFO is pre-created by `tmpfiles.d` as `filip:_snapserver 0640` rather than
+by either side, so its ownership does not depend on which starts first.
+
+### Both snapclients are user units
+
+The packaged `snapclient.service` runs as `_snapclient`, which cannot reach
+`filip`'s PipeWire socket in `XDG_RUNTIME_DIR` — and on hifi2 PipeWire is what
+puts the audio on one channel. The packaged unit is disabled on both boxes and
+replaced with a user unit; `loginctl enable-linger` is what lets those run
+without a login session.
+
+### The screen and CEC read snapserver
+
+`meta_soloist.py` is a snapserver stream plugin: Soloist's WebSocket in,
+snapserver's plugin protocol out, so every client can ask the server what is
+playing. Without it a `pipe://` source carries raw PCM and no metadata at all.
+
+It is **metadata only**. Soloist's WebSocket command envelope is undocumented,
+and guessing at it risks sending the wrong thing to a live session, so
+`canControl` is false and control requests get a proper JSON-RPC *method not
+found* rather than being silently accepted. Play/pause from snapweb is therefore
+not wired up; use Spotify.
+
+Both daemons on the Zero send `Server.GetStatus` on connect, because snapserver
+says nothing until state changes — without it the screen would sit on *Ready*
+until the next track and CEC would miss a session already in progress. They then
+follow `Stream.OnProperties` and `Stream.OnUpdate`. The stream going **idle** is
+a state Soloist had no equivalent of, and it clears the screen rather than
+leaving the last track up forever.
+
+`main`'s "adopt the first state silently" rule survives unchanged and matters
+for the same reason: the `GetStatus` reply may describe a session that has been
+sitting paused for hours, and acting on it would claim active source — switching
+the receiver's input and waking the TV — on every restart and every boot.
 
 ## Install
 
 ```bash
 git clone -b aux <this-repo> ~/soloist-hdmi
 cd ~/soloist-hdmi
-./install.sh
+./install.sh server      # on hifi2
+./install.sh client      # on hifi
 ```
 
-Then put your API key in `~/.config/soloist-hdmi/env` and:
-
-```bash
-systemctl --user restart soloist.service
-```
-
-Pair once by opening Spotify on any device on the same LAN and picking
-**Hi-Fi System** from the device picker. The session is stored in
-`~/.local/state/soloist`, so it survives restarts and reboots.
-
-## Design notes
-
-Things here that are deliberate, and will bite if changed casually.
-
-### The API key is not in this repo
-
-Unchanged from `main`. It lives in `~/.config/soloist-hdmi/env`, mode `0600`,
-loaded via `EnvironmentFile=`. The path is **not** `~/.config/soloist/` — for a
-*user* unit, systemd resolves `StateDirectory=` to `~/.local/state/soloist` but
-will silently symlink it onto `~/.config/soloist` if that directory exists,
-dropping the secret into the same directory Soloist writes state and crash dumps
-into.
-
-Soloist only accepts the key as a command-line flag, so it is visible in `ps`
-and in `systemctl status` output to any local user. On a single-user appliance
-that is acceptable; it is worth knowing before adding other accounts.
-
-### 100 % volume is +4 dB on this card, not unity
-
-This is the one place where porting `main`'s design *literally* breaks it.
-
-`main` runs the sink at 1.00 and `SOLOIST_INITIAL_VOLUME=100` so that no digital
-attenuation is applied and the receiver's analog volume does the work. That
-reasoning is sound and it carries over — but the bcm2835 hardware mixer does
-not behave like the HDMI one. Its `PCM` control runs:
-
-```
-$ amixer -c 0 sget PCM
-  Limits: Playback -10239 - 400
-  Mono: Playback 400 [100%] [4.00dB] [on]
-```
-
-from -102.39 dB to **+4.00 dB**, and WirePlumber maps sink volume 1.00 onto the
-top of that range. So "no attenuation" ported as-is is +4 dB of digital *boost*
-ahead of an 11-bit-ish PWM DAC, and full-scale material clips.
-
-The mapping is `dB = 4.00 + 60·log₁₀(volume)`, which is worth knowing only
-because it makes clear there is no volume setting that is both 1.00 and 0 dB.
-So the fix is not to pick a magic number, it is to take the hardware control out
-of the loop: `wireplumber/50-aux-softmixer.conf` sets `api.alsa.soft-mixer`, so
-volume is applied in software — a no-op multiply at 1.00 — and the ALSA control
-is never written. `install.sh` pins it at `0dB` and runs `alsactl store` so
-`alsa-restore` puts it back at every boot.
-
-**Turn the amplifier down before first playback.** That part is unchanged.
-
-#### Two matches, on two different keys, and neither is redundant
-
-`50-aux-softmixer.conf` looks like it matches the same card twice. It does, and
-both are load-bearing, because volume reaches the card by two separate paths:
-
-- the **node**'s own mixer, and
-- the **device**'s route, which is set from `device.routes.default-sink-volume`.
-
-Setting `api.alsa.soft-mixer` on the node alone leaves the route path intact,
-and the route path is the one that actually bites — the node prop reads back as
-`True` while the control still snaps to +4 dB on every WirePlumber restart,
-which is a convincing way to think the setting did nothing.
-
-The two objects then have to be matched on *different* keys. `alsa.card_name` is
-not yet populated on the device object when device rules are evaluated, only
-`api.alsa.card.name` is; match the device on `alsa.card_name` and it silently
-does not match. Matching on the card's ALSA name rather than the node name also
-keeps this file free of the SoC address, so it is the one config here that needs
-no per-board substitution.
-
-`device.restore-routes = false` looks like it should help and does not: with
-route restore off WirePlumber applies `device.routes.default-sink-volume`
-instead, which defaults to exactly the 0.40 you were trying to get away from.
-
-### Mono, on the right channel only
-
-There is one speaker and it is wired to the right side of the jack.
-
-`pipewire/20-mono-right.conf` publishes a sink with a single `MONO` channel and
-loops it into the hardware sink positioned at `FR`. Soloist targets that sink by
-name, so:
-
-- **Both source channels survive.** PipeWire's channel mixer downmixes stereo
-  into the mono sink at `0.5·FL + 0.5·FR`. Nothing is dropped, and because the
-  coefficients sum to 1.0 a centred mix cannot clip. Sending the hardware sink
-  a stereo stream and simply not connecting the left plug would instead throw
-  away everything panned left.
-- **`stream.dont-remix = true` is what makes it one channel.** Without it
-  PipeWire helpfully upmixes the single channel back out to both `FL` and `FR`,
-  which is the opposite of the point. With it the link is positional, `FR` to
-  `FR`, and `FL` is left as digital silence.
-- **Targeting by node name survives a default-sink change.** If an HDMI sink
-  ever appears — plug a monitor in — WirePlumber may move the system default to
-  it. Soloist is pinned to `soloist_mono_right` and does not care.
-
-Verified end to end rather than by reading the config, by playing a stereo file
-with 440 Hz on the left and 997 Hz on the right into the mono sink and capturing
-the hardware sink's monitor:
-
-| channel | RMS | 440 Hz | 997 Hz |
-|---|---|---|---|
-| left | `-inf` | `-inf` | `-inf` |
-| right | -13.0 dB | -13.0 dB | -13.0 dB |
-
-Left is digital silence and right carries both tones, each at -13.0 dB — the
-tones went in at 0.45 amplitude (-6.9 dB) and 0.5·FL + 0.5·FR predicts
--12.96 dB.
-
-To go back to two speakers, delete
-`~/.config/pipewire/pipewire.conf.d/20-mono-right.conf`, set
-`SOLOIST_PIPEWIRE_NODE` to the hardware sink from `scripts/find-audio-node.sh`,
-and restart pipewire and soloist.
-
-### 44.1 kHz, not 48 kHz
-
-As on `main`, and for the same reason: Spotify streams at 44.1 kHz and PipeWire
-defaults to 48 kHz, which would resample every track. The bcm2835 device accepts
-44.1 kHz directly — `/proc/asound/card0/pcm0p/sub0/hw_params` reports
-`rate: 44100` with no plug layer interposed — so the resampler drops out.
-
-Unlike the HDMI path this is **not** a claim of an untouched signal all the way
-to the speaker. `main` could point at the receiver's EDID and say 44.1 passes
-through; here the analog stage is a PWM DAC driven by firmware, and what it does
-downstream is neither visible nor controllable from Linux. `alsa.resolution_bits`
-reads 16, the real figure is lower, and none of it is ours to change. This
-setting removes the one resample we can see.
-
-The quantum is still raised to 2048 but the *reason* from `main` does not apply:
-that was a Pi Zero 2 W with one small core and ~400 MB of RAM avoiding xruns.
-This is a 4-core Pi 4 with 4 GB under no pressure. It is kept only because
-latency is irrelevant for one-way playback, so fewer wakeups is free.
-
-### If you care about the sound, use a USB DAC
-
-The 3.5mm jack on a Pi is a PWM output filtered by a handful of passives. It is
-fine for a kitchen speaker, which is what this box is. A USB DAC would appear as
-another ALSA card and everything here would carry over — re-run
-`scripts/find-audio-node.sh`, point `node.target` in `20-mono-right.conf` at the
-new sink, and drop `50-aux-softmixer.conf` if the DAC's mixer has a sane range.
-Not done, because it is not the box that was asked for.
-
-### Builds expire after 90 days
-
-Unchanged from `main`. Soloist binaries stop working 90 days after their build
-date and exit with code 10. On a headless box that means the music silently
-stops one day.
-
-- `soloist-update.timer` runs weekly (`Persistent=true`, so a Pi that was off
-  catches up on boot) and installs the current build.
-- `RestartPreventExitStatus=10` in the unit stops systemd from pointlessly
-  restart-looping an expired binary.
-
-Force an update by hand with:
-
-```bash
-./scripts/update-soloist.sh
-```
-
-### Volume normalization is not controllable here
-
-Unchanged from `main`, and re-checked against the build installed here: Soloist
-exposes no normalization flag, no `ctl` command and no field in
-`soloist ctl now --json`. It is an **account-level** setting — change Audio
-Normalization in the Spotify app's playback settings. Anything it applies
-happens inside Soloist before audio reaches PipeWire, so it cannot be undone
-downstream.
-
-### Lingering
-
-`loginctl enable-linger` is required — without it these user services would only
-run while a login session exists, which never happens on a headless box.
+On the server, put your API key in `~/.config/soloist-hdmi/env`, then
+`systemctl --user restart soloist.service`. Pair once by picking **Hi-Fi
+System** in Spotify. For the Hub, pair it to **Hi-Fi System** over Bluetooth in
+the Google Home app under the device's audio settings.
 
 ## Operating it
 
 ```bash
-systemctl --user status soloist.service      # is it up
-journalctl --user -u soloist.service -f      # follow logs
-systemctl --user restart soloist.service     # restart
-./scripts/soloistctl status                  # playback control
-./scripts/soloistctl now                     # what's playing
-./scripts/find-audio-node.sh                 # list sinks
+# server
+systemctl status snapserver
+systemctl --user status soloist snapclient-aux bt-audio-route
+snapcast/scripts/../../scripts/find-audio-node.sh    # list sinks
+
+# client
+systemctl --user status snapclient-hdmi snapcast-display snapcast-cec
 ```
 
-Use `scripts/soloistctl`, not bare `soloist ctl`. The daemon runs with systemd's
-`StateDirectory=`, so its pid and WebSocket files live in
-`~/.local/state/soloist`, while `soloist ctl` defaults to looking in
-`~/.local/share/soloist` — bare `ctl` reports `not running` even mid-playback.
-The wrapper just pins `-D` to the right directory.
+The web UI is at **http://192.168.0.134:1780** — clients, groups, volumes and
+which stream each group is playing. Both speakers live in one group,
+*Whole house*, so one volume control moves the house.
 
-A WebSocket API is bound to `127.0.0.1:3678` (localhost only, deliberately) for
-scripted control. The resolved port is also written to
-`~/.local/state/soloist/ws.port`.
+Clients are pinned with `--hostID` (`hifi2-aux`, `hifi-hdmi`) rather than
+defaulting to the MAC address, so they keep their identity and settings across
+reinstalls instead of accumulating as stale entries.
 
 ## Troubleshooting
 
-**Device missing from the Spotify picker.** Both ends must be on the same LAN
-with client isolation off on the router/AP. Check `systemctl --user status
-soloist.service` for login errors.
-
-**Exit code 10.** The build expired. Run `./scripts/update-soloist.sh`. Note the
-unit will be in `failed` state; the script resets it.
-
-**Playback runs but no sound.** Check the mono sink exists and soloist is
-pointed at it:
+**No sound anywhere.** Check the stream is not idle and that Soloist is actually
+linked to it — Soloist does not reconnect to PipeWire on its own, so restarting
+PipeWire silently orphans it:
 
 ```bash
-./scripts/find-audio-node.sh
-wpctl status
+pw-link -l | grep snapcast_spotify        # should show spotify -> snapcast_spotify
+systemctl --user restart soloist.service  # if not
 ```
 
-If `soloist_mono_right` is missing, the loopback module failed to load — check
-that `~/.config/pipewire/pipewire.conf.d/20-mono-right.conf` had
-`__SINK_NODE__` substituted and names a sink that exists.
+**One room silent.** `snapclient` logs `No chunks available` when the stream is
+idle, which is normal. If it says that while the other room plays, check the
+group assignment in the web UI.
 
-**Sound is quiet, distorted, or clipping.** Check the hardware control is at
-0 dB and not at either end of its range:
+**A room is quieter than the other.** Read *The Zero had been playing 5.4 dB
+quiet* above, then check the saved stream state on the quiet box:
 
 ```bash
-amixer -c 0 sget PCM
+grep media.role:Music ~/.local/state/wireplumber/stream-properties
 ```
 
-`[100%] [4.00dB]` means the soft-mixer rule is not taking effect and WirePlumber
-is driving the control — confirm both matches in
-`~/.config/wireplumber/wireplumber.conf.d/50-aux-softmixer.conf` are present,
-restart wireplumber, then re-pin with `amixer -c 0 sset PCM 0dB && sudo alsactl
-store`.
+**Sound distorted on the aux box.** `amixer -c 0 sget PCM` showing
+`[100%] [4.00dB]` means the soft-mixer rule is not taking effect. Re-pin with
+`amixer -c 0 sset PCM 0dB && sudo alsactl store`.
 
-**Sound in the wrong channel, or in both.** Confirm the routing rather than
-guessing, by capturing the hardware sink's monitor while something plays:
+**The Hub will not pair.** The adapter must be unblocked and discoverable —
+`rfkill list bluetooth` must show *Soft blocked: no*, which it is not by default
+on a fresh image.
 
-```bash
-pw-record --target "$(./scripts/find-audio-node.sh --analog)" -c 2 /tmp/cap.wav
-```
+**Screen blank or stale.** `systemctl --user status snapcast-display`, then
+check it reached the server: it logs `connecting to ws://…:1780/jsonrpc`.
 
-Both channels carrying signal means `stream.dont-remix` was lost from
-`20-mono-right.conf`. The left channel carrying signal instead means
-`audio.position` in `playback.props` says `FL`.
+**CEC does nothing.** Everything in `main`'s README still applies — the physical
+and logical addresses fail independently, and `cec-ctl -d /dev/cec0` must show a
+real address and mask `0x0010`.
