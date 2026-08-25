@@ -234,7 +234,7 @@ the Google Home app under the device's audio settings.
 # server
 systemctl status snapserver
 systemctl --user status soloist snapclient-aux bt-audio-route
-snapcast/scripts/../../scripts/find-audio-node.sh    # list sinks
+scripts/find-audio-node.sh                           # list sinks
 
 # client
 systemctl --user status snapclient-hdmi snapcast-display snapcast-cec
