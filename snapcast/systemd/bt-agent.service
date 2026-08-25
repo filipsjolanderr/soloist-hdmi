@@ -1,0 +1,19 @@
+[Unit]
+Description=Bluetooth pairing agent (headless auto-accept)
+Documentation=man:bt-agent(1)
+After=bluetooth.service
+Requires=bluetooth.service
+
+[Service]
+Type=simple
+# NoInputNoOutput is "just works" pairing: there is no screen or keypad here to
+# confirm a passkey on, which is exactly how a standalone BT speaker behaves.
+# It also means anything in range can pair while the adapter is discoverable -
+# turn discoverable off once the Hub is paired if that matters:
+#   bluetoothctl -- discoverable off
+ExecStart=/usr/bin/bt-agent -c NoInputNoOutput
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

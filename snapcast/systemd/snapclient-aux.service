@@ -1,0 +1,26 @@
+[Unit]
+Description=Snapcast client -> aux jack (mono, right channel)
+# A *user* unit, not the packaged system one. The packaged snapclient.service
+# runs as _snapclient, which cannot reach filip's PipeWire socket in
+# XDG_RUNTIME_DIR - and PipeWire is what puts the audio on one channel. The
+# system unit is disabled; this replaces it.
+After=pipewire.service wireplumber.service pipewire-pulse.service
+Wants=pipewire.service wireplumber.service pipewire-pulse.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# --player pulse talks to pipewire-pulse, so -s takes a PipeWire node name.
+# aux_mono_right is the MONO sink that lands everything on the right channel;
+# the stereo stream is downmixed into it by PipeWire, not by snapclient.
+ExecStart=/usr/bin/snapclient \
+    --host 127.0.0.1 \
+    --player pulse \
+    -s aux_mono_right \
+    --hostID hifi2-aux \
+    --logsink stdout
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

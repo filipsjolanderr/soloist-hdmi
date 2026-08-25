@@ -1,0 +1,28 @@
+[Unit]
+Description=Drive the receiver over HDMI-CEC from Snapcast playback state
+After=snapclient-hdmi.service
+Wants=snapclient-hdmi.service
+# The script reconnects on its own, so a snapserver restart is not fatal.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# Without this python buffers stdout when it is not a tty and the journal
+# stays empty, which makes the service look silently broken.
+Environment=PYTHONUNBUFFERED=1
+Environment=SNAPSERVER_HOST=__SERVER__
+Environment=SNAPCAST_STREAM=Spotify
+# still carries the SOLOIST_CEC_* knobs; the API key is not needed here any more
+EnvironmentFile=%h/.config/soloist-hdmi/env
+ExecStart=/usr/bin/python3 %h/soloist-hdmi/snapcast/client-hdmi/snapcast-cec.py
+
+Restart=always
+RestartSec=5
+
+# /dev/cec0 is root:video and the user is in the video group, so cec-ctl needs
+# no privilege. Re-arming after a receiver power cycle does: it calls
+# snapcast/client-hdmi/cec-rearm.sh through sudo, which cannot work under NoNewPrivileges=.
+NoNewPrivileges=false
+
+[Install]
+WantedBy=default.target

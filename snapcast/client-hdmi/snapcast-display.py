@@ -26,8 +26,14 @@ import websockets
 
 LOG = logging.getLogger("display")
 
-STATE_DIR = Path(os.environ.get("STATE_DIRECTORY",
-                 Path.home() / ".local/state/soloist"))
+# Soloist runs on the server box now, not here, so its state directory is gone
+# and its WebSocket is not reachable. What is playing comes from snapserver's
+# control API instead, which also means the screen reports every source the
+# system grows - bluetooth, another Connect endpoint - not just Spotify.
+SNAP_HOST = os.environ.get("SNAPSERVER_HOST", "192.168.0.134")
+SNAP_PORT = os.environ.get("SNAPSERVER_PORT", "1780")
+SNAP_STREAM = os.environ.get("SNAPCAST_STREAM", "Spotify")
+
 CACHE_DIR = Path(os.environ.get("CACHE_DIRECTORY",
                  Path.home() / ".cache/soloist-display"))
 
@@ -458,29 +464,59 @@ class Track:
         return "spin" if self.status in BUSY else "pause"
 
     def update(self, msg):
-        if msg.get("type") == "auth_state":
-            self.device_name = msg.get("device_name", "") or self.device_name
+        """Read snapserver's control API rather than Soloist's WebSocket.
+
+        Three shapes carry the same payload and all three are needed. snapserver
+        pushes nothing until something changes, so the reply to the
+        Server.GetStatus sent on connect is what stops the screen sitting on
+        *Ready* until the next track; Stream.OnProperties carries metadata
+        changes after that, and Stream.OnUpdate carries the stream going
+        idle - which is a state Soloist had no equivalent of and which must
+        clear the screen rather than leave the last track up.
+        """
+        method = msg.get("method")
+        props = None
+
+        if method == "Stream.OnProperties":
+            params = msg.get("params") or {}
+            if params.get("id") not in (None, SNAP_STREAM):
+                return
+            props = params.get("properties")
+
+        elif method == "Stream.OnUpdate":
+            stream = (msg.get("params") or {}).get("stream") or {}
+            if stream.get("id") not in (None, SNAP_STREAM):
+                return
+            if stream.get("status") == "idle":
+                self.clear()
+                return
+            props = stream.get("properties")
+
+        elif "result" in msg:
+            server = (msg.get("result") or {}).get("server") or {}
+            for stream in server.get("streams") or []:
+                if stream.get("id") != SNAP_STREAM:
+                    continue
+                if stream.get("status") == "idle":
+                    self.clear()
+                    return
+                props = stream.get("properties")
+                break
+
+        if not props:
             return
-        if msg.get("type") != "playback_state":
-            return
-        self.status = msg.get("status", "stopped")
-        item = msg.get("item") or {}
-        dec = item.get("decorations") or {}
-        self.title = (dec.get("identity") or {}).get("name", "") or ""
 
-        creators = dec.get("creators") or []
-        names = [((c.get("entity") or {}).get("decorations") or {})
-                 .get("identity", {}).get("name", "") for c in creators]
-        self.artist = ", ".join(n for n in names if n)
-
-        parent = (dec.get("parent") or {}).get("entity") or {}
-        self.album = ((parent.get("decorations") or {})
-                      .get("identity") or {}).get("name", "") or ""
-
-        covers = (dec.get("visual_identity") or {}).get("cover") or []
-        by_size = {c.get("size"): c.get("url") for c in covers}
-        self.cover_url = (by_size.get("large") or by_size.get("xlarge")
-                          or by_size.get("default") or by_size.get("small"))
+        self.status = props.get("playbackStatus") or "stopped"
+        meta = props.get("metadata") or {}
+        self.title = meta.get("title") or ""
+        # snapcast follows MPRIS and gives artist as a list; a string is not
+        # supposed to happen but costs one isinstance to survive.
+        artists = meta.get("artist") or []
+        if isinstance(artists, str):
+            artists = [artists]
+        self.artist = ", ".join(a for a in artists if a)
+        self.album = meta.get("album") or ""
+        self.cover_url = meta.get("artUrl")
 
 
 # --------------------------------------------------------------------------
@@ -718,10 +754,7 @@ class Screen:
 # Main loop
 # --------------------------------------------------------------------------
 def ws_url():
-    addr_f, port_f = STATE_DIR / "ws.addr", STATE_DIR / "ws.port"
-    addr = addr_f.read_text().strip() if addr_f.exists() else "127.0.0.1"
-    port = port_f.read_text().strip() if port_f.exists() else "3678"
-    return f"ws://{addr}:{port}"
+    return f"ws://{SNAP_HOST}:{SNAP_PORT}/jsonrpc"
 
 
 async def run():
@@ -778,6 +811,10 @@ async def run():
             if lost is None:
                 LOG.info("connecting to %s", url)
             async with websockets.connect(url, ping_interval=20) as ws:
+                # snapserver is request/response plus notifications: it says
+                # nothing on its own until state changes, so ask once.
+                await ws.send(json.dumps({"id": 1, "jsonrpc": "2.0",
+                                          "method": "Server.GetStatus"}))
                 async for raw in ws:
                     # only a message clears the outage: a daemon that accepts
                     # a connection and drops it is not a daemon that is back,
@@ -811,7 +848,7 @@ async def run():
             # months and an unreachable daemon should not fill the journal
             if lost is None:
                 lost = time.monotonic()
-                LOG.warning("websocket error: %s (retrying every %ds)", e, RETRY_MAX)
+                LOG.warning("snapserver websocket error: %s (retrying every %ds)", e, RETRY_MAX)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, RETRY_MAX)
             # Hold the last frame through a daemon restart; drop it if the

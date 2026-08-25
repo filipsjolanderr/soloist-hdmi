@@ -9,7 +9,7 @@ ConditionPathExists=/dev/cec0
 [Service]
 Type=oneshot
 # __REPO__ is substituted by install.sh - a system unit has no %h to expand.
-ExecStart=__REPO__/scripts/cec-rearm.sh
+ExecStart=__REPO__/snapcast/client-hdmi/cec-rearm.sh
 # 75 (EX_TEMPFAIL) means the receiver was off, so there was no EDID to take an
 # address from. That is an ordinary state for a hi-fi, not a failure worth
 # showing up in `systemctl --failed`; the next hotplug re-runs this anyway.

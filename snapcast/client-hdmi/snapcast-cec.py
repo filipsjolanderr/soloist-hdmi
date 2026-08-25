@@ -24,8 +24,12 @@ import websockets
 
 LOG = logging.getLogger("cec")
 
-STATE_DIR = Path(os.environ.get("STATE_DIRECTORY",
-                 Path.home() / ".local/state/soloist"))
+# Soloist runs on the server box now. What counts as "a session is happening"
+# comes from snapserver instead, which is also what makes this correct for any
+# future source rather than only for Spotify.
+SNAP_HOST = os.environ.get("SNAPSERVER_HOST", "192.168.0.134")
+SNAP_PORT = os.environ.get("SNAPSERVER_PORT", "1780")
+SNAP_STREAM = os.environ.get("SNAPCAST_STREAM", "Spotify")
 REPO = Path(__file__).resolve().parent.parent
 
 CEC_DEV = os.environ.get("SOLOIST_CEC_DEVICE", "/dev/cec0")
@@ -253,10 +257,51 @@ def standby():
 # Main loop
 # --------------------------------------------------------------------------
 def ws_url():
-    addr_f, port_f = STATE_DIR / "ws.addr", STATE_DIR / "ws.port"
-    addr = addr_f.read_text().strip() if addr_f.exists() else "127.0.0.1"
-    port = port_f.read_text().strip() if port_f.exists() else "3678"
-    return f"ws://{addr}:{port}"
+    return f"ws://{SNAP_HOST}:{SNAP_PORT}/jsonrpc"
+
+
+def stream_status(msg):
+    """What the watched stream is doing, per one snapserver message.
+
+    Returns "playing", "paused", "stopped", or None when the message says
+    nothing about our stream - snapserver is chatty about clients and volumes
+    and most of it is not ours.
+
+    Playing and paused are reported apart, not collapsed into "in use". Both
+    still count as in use for the wake and the idle timer - picking the device
+    in Spotify and leaving it paused is someone reaching for the hi-fi - but the
+    first state seen after connecting has to tell them apart. See the main loop.
+    """
+    method = msg.get("method")
+    props = None
+
+    if method == "Stream.OnProperties":
+        params = msg.get("params") or {}
+        if params.get("id") not in (None, SNAP_STREAM):
+            return None
+        props = params.get("properties")
+
+    elif method == "Stream.OnUpdate":
+        stream = (msg.get("params") or {}).get("stream") or {}
+        if stream.get("id") not in (None, SNAP_STREAM):
+            return None
+        if stream.get("status") == "idle":
+            return "stopped"
+        props = stream.get("properties")
+
+    elif "result" in msg:
+        server = (msg.get("result") or {}).get("server") or {}
+        for stream in server.get("streams") or []:
+            if stream.get("id") != SNAP_STREAM:
+                continue
+            if stream.get("status") == "idle":
+                return "stopped"
+            props = stream.get("properties")
+            break
+
+    if not props:
+        return None
+    return props.get("playbackStatus") or "stopped"
 
 
 async def run():
@@ -298,23 +343,43 @@ async def run():
             async with websockets.connect(url, ping_interval=20) as ws:
                 backoff = 1
                 first = True
+                # snapserver says nothing until state changes; ask once so a
+                # session already in progress is adopted rather than missed.
+                await ws.send(json.dumps({"id": 1, "jsonrpc": "2.0",
+                                          "method": "Server.GetStatus"}))
                 async for raw in ws:
                     try:
                         msg = json.loads(raw)
                     except json.JSONDecodeError:
                         continue
-                    if msg.get("type") != "playback_state":
+                    status = stream_status(msg)
+                    if status is None:
                         continue
-                    now_active = msg.get("status") in ("playing", "paused")
+                    now_active = status in ("playing", "paused")
                     if first:
-                        # Soloist replays the current state the moment we
-                        # connect. A session that was already sitting there
+                        # The Server.GetStatus reply is the state as it already
+                        # is, and what to do with it depends on which state.
+                        #
+                        # Paused is adopted silently. A session sitting there
                         # paused is not someone reaching for the device, and
-                        # acting on it would claim active source - switching
-                        # the receiver's input and waking the TV - on every
-                        # daemon restart and every boot. Adopt that first
-                        # state silently; act only on what changes after it.
+                        # claiming active source for it would switch the
+                        # receiver's input and wake the TV on every daemon
+                        # restart and every boot.
+                        #
+                        # Playing is not the same thing and must not be adopted
+                        # silently: audio is being sent right now, and if the
+                        # receiver is on another input it goes nowhere at all.
+                        # That is not hypothetical - it is exactly what happens
+                        # when this daemon is restarted mid-track, and it looks
+                        # from the sofa like the HDMI output is broken. The Pi
+                        # is happily playing into a sink nobody is listening to;
+                        # the ELD reads back empty, which is the tell.
                         first = False
+                        if status == "playing":
+                            LOG.info("stream already playing on connect, "
+                                     "claiming active source")
+                            slept = False
+                            await asyncio.to_thread(wake)
                     elif now_active and not active:
                         slept = False
                         await asyncio.to_thread(wake)
@@ -322,8 +387,8 @@ async def run():
                         idle_since = time.monotonic()
                     active = now_active
         except Exception as e:
-            LOG.warning("websocket error: %s (retry in %ds)", e, backoff)
-            # Soloist being gone is not the receiver's fault - do not touch it,
+            LOG.warning("snapserver websocket error: %s (retry in %ds)", e, backoff)
+            # snapserver being gone is not the receiver's fault - do not touch it,
             # just stop counting this as playing.
             if active:
                 idle_since = time.monotonic()
