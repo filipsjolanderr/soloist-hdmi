@@ -322,16 +322,29 @@ The asymmetry between the two boxes is the whole story, and it is structural:
 | rx bitrate | 433 Mbit/s | 6.5 Mbit/s |
 
 **The Pi Zero 2 W has no 5 GHz radio.** It cannot join the fast SSID, and the
-fast SSID has no 2.4 GHz counterpart to fall back to, so there is no software
-fix for this and no configuration that makes it go away. In rough order of
+fast SSID has no 2.4 GHz counterpart to fall back to, so nothing on the Pi can
+fix this - the lever is the radio environment, not the software. In order of
 effect:
 
-- **Wire it.** The Zero 2 W's micro-USB OTG port takes a USB-Ethernet adapter.
-  This is the only change that removes the problem rather than reducing it.
-- **Move the mesh off channel 3.** 2.4 GHz has three non-overlapping channels,
-  1, 6 and 11, and channel 3 collides with both 1 - where a neighbouring AP sits
-  only a few dB down - and 6. Channel 6 scanned completely empty here. Free, and
-  an AP-side setting.
+- **Wire it**, if it ever comes back. The Zero 2 W's micro-USB OTG port takes a
+  USB-Ethernet adapter. This is the only change that removes 2.4 GHz from the
+  picture entirely rather than making it good enough.
+- **Keep the 2.4 GHz mesh on a non-overlapping channel.** This is what actually
+  fixed it here, and it cost nothing. 2.4 GHz has only three non-overlapping
+  channels - 1, 6 and 11 - and the mesh was on **3**, which collides with both 1
+  (a neighbouring AP a few dB down) and 6. Moving it to 6, which scanned empty:
+
+  | | channel 3 | channel 6 |
+  |---|---|---|
+  | reconnects | ~1.4/min | **0 in 8 min** |
+  | packet loss | 3.33 % | 0.83 % |
+  | max rtt | 432 ms | 180 ms |
+  | rx bitrate | 6.5 Mbit/s | 19.5 Mbit/s |
+  | `tx failed` | ~1.6/s | 0.025/s |
+
+  Measured with music streaming continuously in both windows, which is worth
+  saying because an idle stream sends nothing and would show zero reconnects for
+  the wrong reason.
 - **Move the Zero, or put a mesh node nearer it.** -65 dBm at 6.5 Mbit/s rx
   suggests distance or something absorbing, an AV cabinet included.
 
