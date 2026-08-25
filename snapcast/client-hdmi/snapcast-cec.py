@@ -40,7 +40,7 @@ AMP = os.environ.get("SOLOIST_CEC_AMP", "5")
 # CEC caps OSD names at 14 characters. Matching the Connect name keeps the
 # amplifier's input list and Spotify's device picker in agreement.
 OSD_NAME = os.environ.get("SOLOIST_CEC_OSD_NAME", "Hi-Fi System")[:14]
-IDLE_MINUTES = float(os.environ.get("SOLOIST_CEC_IDLE_MINUTES", "30"))
+IDLE_MINUTES = float(os.environ.get("SOLOIST_CEC_IDLE_MINUTES", "10"))
 DO_STANDBY = os.environ.get("SOLOIST_CEC_STANDBY", "1") not in ("0", "no", "false")
 DO_WAKE = os.environ.get("SOLOIST_CEC_WAKE", "1") not in ("0", "no", "false")
 
@@ -313,10 +313,19 @@ async def run():
     # and the other devices keep looking for it.
     await asyncio.to_thread(configure)
 
-    # "active" covers paused as well as playing: picking the device in Spotify
-    # is itself a reason to switch the receiver over, and pausing is not a
-    # reason to switch it away.
-    active = False
+    # Two different questions, and they need different answers.
+    #
+    # "in use" covers paused as well as playing, and drives the *wake*: picking
+    # the device in Spotify is itself a reason to switch the receiver over, and
+    # pausing is not a reason to switch it away.
+    #
+    # "playing" is playing only, and drives the *idle timer*. A session left
+    # paused is precisely the case worth powering down for - the amplifier is
+    # on, its input is selected, and it is amplifying silence, possibly all
+    # night. Collapsing the two into one flag meant only a fully stopped stream
+    # ever started the countdown, so pausing kept the amplifier awake forever.
+    in_use = False
+    playing = False
     idle_since = time.monotonic()
     slept = False   # already sent to standby for this idle stretch
 
@@ -324,7 +333,7 @@ async def run():
         nonlocal slept
         while True:
             await asyncio.sleep(IDLE_POLL_SECONDS)
-            if active or slept or IDLE_MINUTES <= 0:
+            if playing or slept or IDLE_MINUTES <= 0:
                 continue
             if time.monotonic() - idle_since >= IDLE_MINUTES * 60:
                 try:
@@ -355,7 +364,8 @@ async def run():
                     status = stream_status(msg)
                     if status is None:
                         continue
-                    now_active = status in ("playing", "paused")
+                    now_in_use = status in ("playing", "paused")
+                    now_playing = status == "playing"
                     if first:
                         # The Server.GetStatus reply is the state as it already
                         # is, and what to do with it depends on which state.
@@ -375,24 +385,37 @@ async def run():
                         # is happily playing into a sink nobody is listening to;
                         # the ELD reads back empty, which is the tell.
                         first = False
-                        if status == "playing":
+                        if now_playing:
                             LOG.info("stream already playing on connect, "
                                      "claiming active source")
                             slept = False
                             await asyncio.to_thread(wake)
-                    elif now_active and not active:
+                        else:
+                            # Count a session found paused from now, not from
+                            # whenever this process happened to start.
+                            idle_since = time.monotonic()
+                    elif now_in_use and not in_use:
                         slept = False
                         await asyncio.to_thread(wake)
-                    elif not now_active and active:
+
+                    # The countdown tracks playing, not in_use, so pause starts
+                    # it and resume cancels it.
+                    if now_playing and not playing:
+                        slept = False
+                    elif playing and not now_playing:
                         idle_since = time.monotonic()
-                    active = now_active
+                        LOG.info("stopped playing (%s), amplifier standby in "
+                                 "%g min unless it resumes", status, IDLE_MINUTES)
+
+                    in_use, playing = now_in_use, now_playing
         except Exception as e:
             LOG.warning("snapserver websocket error: %s (retry in %ds)", e, backoff)
             # snapserver being gone is not the receiver's fault - do not touch it,
             # just stop counting this as playing.
-            if active:
+            if playing:
                 idle_since = time.monotonic()
-            active = False
+            in_use = False
+            playing = False
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30)
 

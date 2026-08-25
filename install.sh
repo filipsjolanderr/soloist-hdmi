@@ -144,6 +144,12 @@ else
     sudo systemctl disable --now snapclient.service 2>/dev/null || true
     sudo loginctl enable-linger "$(id -un)"
 
+    if [[ ! -f "$ENV_FILE" ]]; then
+        mkdir -p "$(dirname "$ENV_FILE")"
+        cp "$REPO/config/client.env.example" "$ENV_FILE"
+    fi
+    chmod 700 "$(dirname "$ENV_FILE")"; chmod 600 "$ENV_FILE"
+
     # /dev/fb0 access comes from the video group.
     id -nG "$(id -un)" | tr " " "\n" | grep -qx video \
         || { sudo usermod -aG video "$(id -un)"; echo "    added to video group - log out and back in"; }
