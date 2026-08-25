@@ -260,16 +260,17 @@ def ws_url():
     return f"ws://{SNAP_HOST}:{SNAP_PORT}/jsonrpc"
 
 
-def stream_active(msg):
-    """Is the watched stream in use, per one snapserver message?
+def stream_status(msg):
+    """What the watched stream is doing, per one snapserver message.
 
-    Returns True/False, or None when the message says nothing about our stream -
-    snapserver is chatty about clients and volumes and most of it is not ours.
+    Returns "playing", "paused", "stopped", or None when the message says
+    nothing about our stream - snapserver is chatty about clients and volumes
+    and most of it is not ours.
 
-    "In use" is playing *or* paused, exactly as before: picking the device in
-    Spotify and leaving it paused is still someone reaching for the hi-fi, and
-    is reason enough to switch the receiver over. The one genuinely new state is
-    the stream going idle, which Soloist had no equivalent of.
+    Playing and paused are reported apart, not collapsed into "in use". Both
+    still count as in use for the wake and the idle timer - picking the device
+    in Spotify and leaving it paused is someone reaching for the hi-fi - but the
+    first state seen after connecting has to tell them apart. See the main loop.
     """
     method = msg.get("method")
     props = None
@@ -285,7 +286,7 @@ def stream_active(msg):
         if stream.get("id") not in (None, SNAP_STREAM):
             return None
         if stream.get("status") == "idle":
-            return False
+            return "stopped"
         props = stream.get("properties")
 
     elif "result" in msg:
@@ -294,13 +295,13 @@ def stream_active(msg):
             if stream.get("id") != SNAP_STREAM:
                 continue
             if stream.get("status") == "idle":
-                return False
+                return "stopped"
             props = stream.get("properties")
             break
 
     if not props:
         return None
-    return props.get("playbackStatus") in ("playing", "paused")
+    return props.get("playbackStatus") or "stopped"
 
 
 async def run():
@@ -351,18 +352,34 @@ async def run():
                         msg = json.loads(raw)
                     except json.JSONDecodeError:
                         continue
-                    now_active = stream_active(msg)
-                    if now_active is None:
+                    status = stream_status(msg)
+                    if status is None:
                         continue
+                    now_active = status in ("playing", "paused")
                     if first:
                         # The Server.GetStatus reply is the state as it already
-                        # is. A session that was already sitting there
+                        # is, and what to do with it depends on which state.
+                        #
+                        # Paused is adopted silently. A session sitting there
                         # paused is not someone reaching for the device, and
-                        # acting on it would claim active source - switching
-                        # the receiver's input and waking the TV - on every
-                        # daemon restart and every boot. Adopt that first
-                        # state silently; act only on what changes after it.
+                        # claiming active source for it would switch the
+                        # receiver's input and wake the TV on every daemon
+                        # restart and every boot.
+                        #
+                        # Playing is not the same thing and must not be adopted
+                        # silently: audio is being sent right now, and if the
+                        # receiver is on another input it goes nowhere at all.
+                        # That is not hypothetical - it is exactly what happens
+                        # when this daemon is restarted mid-track, and it looks
+                        # from the sofa like the HDMI output is broken. The Pi
+                        # is happily playing into a sink nobody is listening to;
+                        # the ELD reads back empty, which is the tell.
                         first = False
+                        if status == "playing":
+                            LOG.info("stream already playing on connect, "
+                                     "claiming active source")
+                            slept = False
+                            await asyncio.to_thread(wake)
                     elif now_active and not active:
                         slept = False
                         await asyncio.to_thread(wake)

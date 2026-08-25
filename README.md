@@ -281,6 +281,32 @@ on a fresh image.
 **Screen blank or stale.** `systemctl --user status snapcast-display`, then
 check it reached the server: it logs `connecting to ws://…:1780/jsonrpc`.
 
+**HDMI plays silently — the Pi thinks it is playing but nothing comes out.**
+Almost always the receiver is *on* but showing a different input, so the audio
+has nowhere to land. The tell is the ELD, which is the receiver's reply about
+what it can play:
+
+```bash
+wc -c /proc/asound/card0/eld#0     # 0 bytes = nobody downstream is listening
+```
+
+Zero bytes with the connector `connected` and `hw_params` reading `RUNNING` is
+exactly this. Claim the input back:
+
+```bash
+cec-ctl -d /dev/cec0 -s --to 0 --image-view-on
+cec-ctl -d /dev/cec0 -s --active-source phys-addr=0x2300
+```
+
+The ELD fills in immediately if that was it. `snapcast-cec` now does this by
+itself when it connects and finds the stream *already playing* — see the `first`
+branch in the main loop, and note it deliberately still does **not** do it for a
+stream that is merely paused, which would steal the input on every boot.
+
+It does not fight you either: if you switch the receiver to another input
+mid-track on purpose, nothing switches it back. That is the same restraint as
+the idle timer's, and the cost is that this failure can recur by hand.
+
 **CEC does nothing.** Everything in `main`'s README still applies — the physical
 and logical addresses fail independently, and `cec-ctl -d /dev/cec0` must show a
 real address and mask `0x0010`.
