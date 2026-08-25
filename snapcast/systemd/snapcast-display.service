@@ -1,0 +1,39 @@
+[Unit]
+Description=Now-playing screen on the HDMI output (from Snapcast)
+After=snapclient-hdmi.service
+Wants=snapclient-hdmi.service
+# The script reconnects on its own, so a snapserver restart is not fatal.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# Without this python buffers stdout when it is not a tty and the journal
+# stays empty, which makes the service look silently broken.
+Environment=PYTHONUNBUFFERED=1
+# Album art cache -> ~/.cache/soloist-display. No StateDirectory: there is no
+# local state any more, the now-playing state comes from snapserver over the
+# network.
+Environment=SNAPSERVER_HOST=192.168.0.134
+Environment=SNAPCAST_STREAM=Spotify
+CacheDirectory=soloist-display
+
+# Take the framebuffer from the text console, and give it back on exit.
+ExecStartPre=/usr/bin/sudo %h/soloist-hdmi/snapcast/client-hdmi/fbcon.sh release
+ExecStart=/usr/bin/python3 %h/soloist-hdmi/snapcast/client-hdmi/snapcast-display.py
+ExecStopPost=-/usr/bin/sudo %h/soloist-hdmi/snapcast/client-hdmi/fbcon.sh restore
+
+Restart=always
+RestartSec=5
+
+# This unit is deliberately unsandboxed:
+#  - /dev/fb0 needs real device access, so PrivateDevices= must stay off
+#    (the user is already in the video group).
+#  - fbcon.sh writes /sys/class/vtconsole/*/bind, so ProtectKernelTunables=
+#    must stay off.
+#  - ExecStartPre/ExecStopPost call sudo, which cannot work under
+#    NoNewPrivileges=. The other two are already the defaults; this one is
+#    stated because it is the constraint that actually binds.
+NoNewPrivileges=false
+
+[Install]
+WantedBy=default.target
