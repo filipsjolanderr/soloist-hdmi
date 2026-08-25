@@ -126,7 +126,19 @@ else
     echo "==> Installing packages"
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
         snapclient python3-pil python3-numpy python3-websockets v4l-utils \
-        fonts-nunito-sans fonts-montserrat fonts-dejavu-core
+        fonts-nunito-sans fonts-montserrat fonts-dejavu-core iw
+
+    # brcmfmac defaults power save ON, which parks the radio between beacons and
+    # turns a 2 ms LAN round trip into an occasional 70 ms one. Snapcast's time
+    # sync times out on those spikes and the client tears down the whole session
+    # and reconnects, roughly twice a minute, and every reconnect stops and
+    # restarts the player - a few seconds of silence each time.
+    echo "==> Disabling wifi power save"
+    sudo cp "$REPO/snapcast/client-hdmi/wifi-powersave.conf" \
+        /etc/NetworkManager/conf.d/wifi-powersave.conf
+    sudo nmcli connection reload || true
+    # immediate effect without bouncing the link
+    sudo /usr/sbin/iw dev wlan0 set power_save off 2>/dev/null || true
 
     echo "==> CEC re-arm (a system unit: it writes sysfs and is udev-triggered)"
     sed "s|__REPO__|$REPO|g" "$REPO/snapcast/systemd/cec-rearm.service" \
