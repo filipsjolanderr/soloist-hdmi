@@ -1,7 +1,7 @@
 [Unit]
-Description=Spotify Soloist (Spotify Connect -> HDMI)
+Description=Spotify Soloist (Spotify Connect -> analog jack, mono right)
 Documentation=https://developer.spotify.com/documentation/soloist
-# PipeWire provides the HDMI sink; start after it is up.
+# PipeWire provides the mono sink; start after it is up.
 After=pipewire.service wireplumber.service pipewire-pulse.service
 Wants=pipewire.service wireplumber.service
 # Never give up: on boot the service may start before Wi-Fi has associated,
