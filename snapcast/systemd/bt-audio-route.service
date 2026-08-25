@@ -1,0 +1,16 @@
+[Unit]
+Description=Route Bluetooth audio sources to the aux speaker
+After=pipewire.service wireplumber.service bluetooth.target
+Wants=pipewire.service wireplumber.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=PYTHONUNBUFFERED=1
+Environment=BT_ROUTE_TARGET=aux_mono_right
+ExecStart=/usr/bin/python3 %h/soloist-hdmi/snapcast/scripts/bt-audio-route.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
