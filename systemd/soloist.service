@@ -4,6 +4,12 @@ Documentation=https://developer.spotify.com/documentation/soloist
 # PipeWire provides the mono sink; start after it is up.
 After=pipewire.service wireplumber.service pipewire-pulse.service
 Wants=pipewire.service wireplumber.service
+# soloist opens its PipeWire stream once and does not reconnect: restart
+# PipeWire underneath it and it keeps running, keeps reporting "playing", and
+# silently feeds nothing into the FIFO. PartOf makes systemd restart it with
+# PipeWire so that cannot happen. snapclient deliberately does not need this -
+# it notices and reconnects on its own.
+PartOf=pipewire.service
 # Never give up: on boot the service may start before Wi-Fi has associated,
 # and Restart=always must not trip systemd's start-rate limiter.
 StartLimitIntervalSec=0
