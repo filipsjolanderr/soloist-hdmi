@@ -23,7 +23,7 @@ and most of `main`'s hard-won HDMI notes no longer apply — see *What is gone*.
               │                              │
      snapclient (local)              snapclient over wifi
      aux_mono_right → FR             hifi — Pi Zero 2 W, .162
-     3.5mm jack, one speaker         HDMI → Sony receiver
+     USB DAC, one speaker            HDMI → Sony receiver
                                      + now-playing screen on /dev/fb0
                                      + receiver wake/standby over CEC
 
@@ -34,7 +34,7 @@ and most of `main`'s hard-won HDMI notes no longer apply — see *What is gone*.
 |---|---|---|
 | Board | Pi 4 Model B Rev 1.5 | Pi Zero 2 W Rev 1.0 |
 | Role | server + client | client |
-| Output | 3.5mm jack, mono → right | HDMI → Sony receiver |
+| Output | USB DAC → 3.5mm, mono → right | HDMI → Sony receiver |
 | Also runs | Soloist, Bluetooth sink | TV screen, CEC |
 
 ## What is gone
@@ -90,31 +90,52 @@ can pair while the adapter is discoverable. Once the Hub is paired:
 bluetoothctl -- discoverable off
 ```
 
-### 100 % volume is +4 dB on this card, not unity
+### 0 dB is the target, and "100 %" is not reliably 0 dB
 
-`main` runs the sink at 1.00 and `SOLOIST_INITIAL_VOLUME=100` so nothing
-attenuates digitally and the amplifier does the work. The reasoning holds; the
-hardware does not cooperate. The bcm2835 `PCM` control runs from **−102.39 dB to
-+4.00 dB**, and WirePlumber maps sink volume 1.00 onto the top of it. Ported
-literally, "no attenuation" is +4 dB of digital *boost* into a PWM DAC, and
-full-scale material clips.
+The speaker is now driven by a **USB DAC** (`HI-XCESS_618 USB Audio`) rather than
+the Pi's own 3.5mm jack. The built-in jack still works as a fallback, so both are
+described here - and they behave *oppositely*, which is exactly why `install.sh`
+asks for `0dB` by name and never for a percentage:
 
-`snapcast/server/50-aux-softmixer.conf` sets `api.alsa.soft-mixer`, so volume is
-applied in software — a no-op multiply at 1.00 — and the ALSA control is never
-written. `install.sh` pins it at `0dB` and runs `alsactl store`.
+| card | mixer range | what "100 %" means |
+|---|---|---|
+| bcm2835 built-in jack | −102.39 .. **+4.00 dB** | +4 dB of digital **boost**, clips |
+| HI-XCESS USB DAC | −23.00 .. **0.00 dB** | exactly 0 dB, correct |
 
-**Both matches in that file are load-bearing and they are not redundant.**
-Volume reaches the card by two paths, the node's mixer and the device's route,
-and *the device route is the one that bites*: set the property on the node alone
-and it reads back as `True` while the control still snaps to +4 dB on every
-WirePlumber restart. The two objects also have to be matched on **different
-keys** — `alsa.card_name` is not yet populated on the device when device rules
-run, only `api.alsa.card.name` is. Matching the card by name rather than by node
-name is also what keeps that one file free of the SoC address.
+So on the built-in jack, running the sink at 1.00 - `main`'s stated design of no
+digital attenuation, letting the amplifier do the work - actually clips. On the
+USB DAC the identical setting is right. `amixer sset PCM 0dB` is correct on both,
+and the card index is derived from whichever sink is in use rather than assumed
+to be card 0, because a USB DAC does not land there.
 
-`device.restore-routes = false` looks like the fix and is not: with route
-restore off, WirePlumber applies `device.routes.default-sink-volume` instead,
-which defaults to exactly the 0.40 you were trying to escape.
+The DAC arrived at **−23 dB**, with WirePlumber's device route holding
+`channelVolumes [0.064, 0.064]` while the node read `1.0`. Setting the sink to
+1.00 put the ALSA control at exactly 30/30 = 0.00 dB.
+
+#### The node reads 1.0 while the route does the attenuating
+
+This is the trap on both cards and it is worth stating on its own, because the
+node is what everything reports and the route is what is actually applied:
+
+```
+NODE  volume=1.0  channelVolumes=[1.0, 1.0]      <- looks correct
+ROUTE 'analog-output' channelVolumes=[0.064, …]  <- what you actually hear
+```
+
+`50-aux-softmixer.conf` sets `api.alsa.soft-mixer` on the bcm2835 card **only**,
+and it needs both a device match and a node match, on *different keys* -
+`alsa.card_name` is not yet populated on the device object when device rules are
+evaluated, only `api.alsa.card.name` is. Match the device on the wrong one and
+it silently does not match while the node prop still reads `True`.
+
+That rule is deliberately left in place. The USB DAC does not need it, since its
+mixer cannot boost, and the rule simply does not match while the DAC is plugged
+in. Unplug the DAC and the built-in jack is protected again with no config
+change.
+
+`device.restore-routes = false` looks like the fix and is not: with route restore
+off, WirePlumber applies `device.routes.default-sink-volume` instead, which
+defaults to exactly the 0.40 you were trying to escape.
 
 ### The Zero had been playing 5.4 dB quiet all along
 
@@ -155,7 +176,25 @@ channel and loops it into the hardware sink positioned at `FR`.
 - **Targeting by node name survives a default-sink change** — plug a monitor
   into hifi2 and WirePlumber may move the default; playback does not care.
 
-### 44.1 kHz and FLAC, end to end
+### The USB DAC is 48 kHz only
+
+`/proc/asound/card3/stream0` reports a **single** supported rate, so the
+"nothing resamples anywhere" property this repo used to have no longer holds for
+the aux room.
+
+The graph nevertheless stays pinned at 44100, which is deliberate. That keeps the
+Spotify source, the FIFO feeding snapserver and the entire HDMI room native, and
+confines the conversion to the one device that cannot avoid it - one resample,
+inside the ALSA node, on a Pi 4 with cores to spare. Moving the graph to 48000
+would resample for *every* room in order to spare the one endpoint that has to
+convert regardless. Check both ends:
+
+```bash
+pw-metadata -n settings | grep clock.rate      # graph:  44100
+cat /proc/asound/card3/pcm0p/sub0/hw_params    # device: 48000
+```
+
+### 44.1 kHz and FLAC on the wire
 
 Spotify streams at 44.1 kHz. PipeWire defaults to 48 kHz and snapserver defaults
 to 48000:16:2; both are pinned to 44100:16:2 so nothing resamples between
@@ -269,6 +308,30 @@ quiet* above, then check the saved stream state on the quiet box:
 ```bash
 grep media.role:Music ~/.local/state/wireplumber/stream-properties
 ```
+
+**Verifying the aux output: capture the sink MONITOR, not "the device".** This
+matters more than it sounds and produced several confidently wrong readings here
+before it was spotted. The USB DAC is a combo device - it has a microphone as
+well as playback - so:
+
+```bash
+pw-record --target <sink> out.wav          # WRONG: records the MICROPHONE
+```
+
+silently attaches to the card's capture side instead of the sink's monitor. It
+succeeds, writes a plausible file, and shows both channels identical at a low
+noise floor with none of your signal in it - which reads exactly like "the
+routing is broken" when the routing is fine. Ask for the monitor explicitly:
+
+```bash
+pw-record -P '{ stream.capture.sink=true }' --target <sink> \
+          --channels 2 --rate 48000 --format s16 out.wav
+```
+
+The tell that you are looking at a bogus capture rather than a real fault is
+**byte-identical channels**: a real stereo capture of a mono-to-right setup has
+one channel at digital zero, not both channels equal. A correct capture here
+reads `LEFT peak 0.000 / -inf` and `RIGHT peak 0.450, both tones at -12.96 dB`.
 
 **Sound distorted on the aux box.** `amixer -c 0 sget PCM` showing
 `[100%] [4.00dB]` means the soft-mixer rule is not taking effect. Re-pin with

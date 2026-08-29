@@ -70,11 +70,28 @@ if [[ "$ROLE" == server ]]; then
     systemctl --user restart pipewire pipewire-pulse
     sleep 3
 
-    # 0 dB, not 100%: on this card 100% is +4.00 dB of digital boost and clips.
-    echo "==> Pinning the analog output at 0 dB"
-    CARD="$(awk '/bcm2835 Headphones/ {print $1; exit}' /proc/asound/cards)"
-    amixer -c "${CARD:-0}" sset PCM 0dB >/dev/null
-    sudo alsactl store
+    # 0 dB explicitly, never "100%", because they are not the same thing and
+    # which one is right depends on the card:
+    #   bcm2835 built-in jack: range -102.39 .. +4.00 dB, so 100% is +4 dB of
+    #                          digital BOOST and clips.
+    #   HI-XCESS USB DAC:      range  -23.00 ..  0.00 dB, so 100% *is* 0 dB.
+    # Asking for 0dB is right on both. Derive the card from the sink actually in
+    # use rather than assuming card 0 - a USB DAC does not land there.
+    echo "==> Pinning the output at 0 dB"
+    CARD="$(pw-dump | python3 -c '
+import json, sys
+want = sys.argv[1]
+for o in json.load(sys.stdin):
+    p = (o.get("info") or {}).get("props") or {}
+    if p.get("node.name") == want:
+        print(p.get("alsa.card", "")); break
+' "$SINK_NODE")"
+    if [[ -n "$CARD" ]]; then
+        amixer -c "$CARD" sset PCM 0dB >/dev/null 2>&1 \
+            || echo "    (no PCM control on card $CARD, skipping)"
+        sudo alsactl store
+        echo "    card $CARD pinned at 0 dB and stored"
+    fi
     unity "$SINK_NODE"
     unity aux_mono_right
 
