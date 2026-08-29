@@ -339,6 +339,21 @@ quiet* above, then check the saved stream state on the quiet box:
 grep media.role:Music ~/.local/state/wireplumber/stream-properties
 ```
 
+**Aux room silent but every measurement says the audio is fine.** Check the
+amplifier's input selector before anything else — an amp sitting on its own
+Bluetooth or optical input produces exactly this, and no amount of looking at
+PipeWire will show it. The digital chain can be confirmed good in one command:
+
+```bash
+pw-record -P '{ stream.capture.sink=true }' --target "$(scripts/find-audio-node.sh --analog)" \
+          --channels 2 --rate 48000 --format s16 /tmp/live.wav
+```
+
+A healthy aux room reads left at digital zero and right carrying signal. If that
+is what you see, the fault is downstream of the Pi: the amp's input, the jack on
+the DAC (several of these adapters have a separate mic input next to the output),
+the cable, or the speaker.
+
 **Verifying the aux output: capture the sink MONITOR, not "the device".** This
 matters more than it sounds and produced several confidently wrong readings here
 before it was spotted. The USB DAC is a combo device - it has a microphone as
