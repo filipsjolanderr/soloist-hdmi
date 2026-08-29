@@ -54,6 +54,8 @@ if [[ "$ROLE" == server ]]; then
     # without this the Bluetooth monitor never starts on a headless box, and
     # BlueZ advertises no Audio Sink UUID at all - see the README
     cp "$REPO/snapcast/server/60-headless-bluetooth.conf" "$HOME/.config/wireplumber/wireplumber.conf.d/"
+    # send Bluetooth through the mono sink instead of straight to the DAC
+    cp "$REPO/snapcast/server/70-bluetooth-to-aux.conf" "$HOME/.config/wireplumber/wireplumber.conf.d/"
 
     echo "==> FIFO between PipeWire and snapserver"
     sudo cp "$REPO/snapcast/server/tmpfiles-snapcast.conf" /etc/tmpfiles.d/snapcast.conf
@@ -97,6 +99,11 @@ for o in json.load(sys.stdin):
     fi
     unity "$SINK_NODE"
     unity aux_mono_right
+    # Anything without an explicit target - Bluetooth above all - must land on
+    # the mono sink, not on the DAC directly, or it plays in stereo into a
+    # speaker that is only wired to one channel.
+    MONO_ID="$(node_id aux_mono_right)"
+    [[ -n "$MONO_ID" ]] && wpctl set-default "$MONO_ID"
 
     echo "==> snapserver"
     sudo install -m 755 "$REPO/snapcast/plugins/meta_soloist.py" \
@@ -121,7 +128,6 @@ for o in json.load(sys.stdin):
        "$REPO/systemd/soloist-update.service" \
        "$REPO/systemd/soloist-update.timer" \
        "$REPO/snapcast/systemd/snapclient-aux.service" \
-       "$REPO/snapcast/systemd/bt-audio-route.service" \
        "$HOME/.config/systemd/user/"
     # the packaged system client runs as _snapclient and cannot reach PipeWire
     sudo systemctl disable --now snapclient.service 2>/dev/null || true
@@ -136,7 +142,7 @@ for o in json.load(sys.stdin):
     sudo loginctl enable-linger "$(id -un)"
     "$REPO/scripts/update-soloist.sh" || true
 
-    systemctl --user enable --now soloist-update.timer snapclient-aux bt-audio-route
+    systemctl --user enable --now soloist-update.timer snapclient-aux
     systemctl --user enable soloist.service
     grep -q 'paste-your-key-here' "$ENV_FILE" \
         || systemctl --user restart soloist.service

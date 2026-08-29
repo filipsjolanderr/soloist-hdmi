@@ -76,11 +76,32 @@ routing straight to the sink. That is fine for music and wrong for a Hub that
 also speaks timers and answers questions. PipeWire mixes the two, so the Hub
 talks *over* whatever Snapcast is playing instead of fighting it for the output.
 
-`scripts/bt-audio-route.py` makes the connection, because PipeWire will not:
-sources are not linked to sinks automatically (PulseAudio's
-`module-bluetooth-policy` used to do this; WirePlumber ships no equivalent). It
-matches `bluez_input.*` specifically rather than "capture the default source",
-which would grab a future USB microphone and feed it to the speaker.
+**Bluetooth arrives as a stream, not a source.** This is the thing to get right,
+and getting it wrong is silent rather than loud. A phone or Hub streaming *to*
+this box appears as:
+
+```
+node.name   = bluez_input.<MAC>.<n>
+media.class = Stream/Output/Audio        <- a playback stream, NOT Audio/Source
+```
+
+so it follows ordinary stream policy and lands on the **default sink** with no
+help needed. An earlier version of this repo shipped a watcher daemon that
+matched `media.class == "Audio/Source"` and spawned a loopback per device; it
+never matched anything, and because a stream with nowhere in particular to go
+still goes *somewhere*, the symptom was not silence but Bluetooth playing in
+plain stereo straight into the DAC - past `aux_mono_right`, so everything panned
+left was discarded. The daemon is gone.
+
+Two things keep it correct instead:
+
+- `aux_mono_right` is the **default sink**, so anything without an explicit
+  target lands on the mono path rather than on the DAC.
+- `70-bluetooth-to-aux.conf` pins `target.object` on `bluez_input.*` anyway, so
+  changing the default later cannot silently reroute Bluetooth.
+
+Soloist and snapclient both name their targets explicitly, so neither is
+affected by the default sink.
 
 #### The Bluetooth monitor does not start on a headless box
 
