@@ -51,6 +51,9 @@ if [[ "$ROLE" == server ]]; then
     cp "$REPO/snapcast/server/10-hifi-aux.conf" "$HOME/.config/pipewire/pipewire.conf.d/"
     cp "$REPO/snapcast/server/30-snapcast-spotify.conf" "$HOME/.config/pipewire/pipewire.conf.d/"
     cp "$REPO/snapcast/server/50-aux-softmixer.conf" "$HOME/.config/wireplumber/wireplumber.conf.d/"
+    # without this the Bluetooth monitor never starts on a headless box, and
+    # BlueZ advertises no Audio Sink UUID at all - see the README
+    cp "$REPO/snapcast/server/60-headless-bluetooth.conf" "$HOME/.config/wireplumber/wireplumber.conf.d/"
 
     echo "==> FIFO between PipeWire and snapserver"
     sudo cp "$REPO/snapcast/server/tmpfiles-snapcast.conf" /etc/tmpfiles.d/snapcast.conf
