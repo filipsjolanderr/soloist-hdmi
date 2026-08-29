@@ -82,6 +82,36 @@ sources are not linked to sinks automatically (PulseAudio's
 matches `bluez_input.*` specifically rather than "capture the default source",
 which would grab a future USB microphone and feed it to the speaker.
 
+#### The Bluetooth monitor does not start on a headless box
+
+This is the one that stops Google Home seeing a speaker at all, and it fails
+silently. `bluez.lua` gates the monitor on logind seat state:
+
+```lua
+if seat_state == "active" then monitor = createMonitor() end
+```
+
+With `loginctl enable-linger` and no login session there is no seat, so the
+state is `online` and never `active`, and the monitor is never created. Nothing
+logs an error — on a desktop this is correct — and WirePlumber still reports the
+component as loaded and the plugin as enabled, so every obvious check says the
+Bluetooth stack is healthy.
+
+The only visible symptom is in BlueZ, and you have to know to look for it:
+
+```bash
+bluetoothctl show | grep UUID          # want "Audio Sink (0000110b)"
+```
+
+Without that UUID the adapter advertises A/V Remote Control and **no audio
+endpoint**, so a phone or a Nest Hub does not offer it as a speaker — there is
+nothing to pair *to*, which reads as "pairing is broken" when pairing was never
+the problem. `60-headless-bluetooth.conf` disables seat monitoring so bluez.lua
+takes its other branch and creates the monitor unconditionally.
+
+The adapter's class also changes from `0x00400414` to `0x006c0414` once the
+audio services register, which is the quickest way to confirm it took.
+
 Pairing is `NoInputNoOutput` — there is no keypad here to confirm a passkey on,
 which is how any standalone BT speaker behaves. It also means anything in range
 can pair while the adapter is discoverable. Once the Hub is paired:
